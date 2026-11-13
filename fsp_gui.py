@@ -23,15 +23,35 @@ Layout:
       * Fifth larger plot window (docked large Matplotlib plot window + optional pop-out window).
 
 Usage:
-  python fsp_gui.py [my_simulation.fsp] [my_simulation.h5]
+  python3 fsp_gui.py                       start with an empty window
+  python3 fsp_gui.py model.fsp             open model.fsp at once (and model.h5 next to it, if any)
+  python3 fsp_gui.py model.fsp fields.h5   open model.fsp with the monitor data of fields.h5
+  python3 fsp_gui.py --install             install the application for you (--install-systemwide: for all users)
+  python3 fsp_gui.py --uninstall           remove the installed application
+  python3 fsp_gui.py --update              install a newer version from GitHub over the installed one
+  python3 fsp_gui.py --version             show the version number
 """
 
+import ast
+import gc
+import json
 import math
 import os
+import plistlib
 import re
+import shlex
+import shutil
 import struct
+import subprocess
 import sys
+import tempfile
+import threading
+import time
 import tkinter as tk
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
 from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
@@ -57,8 +77,31 @@ from fsp_reader import C0, FSPFile, FormatError, _fmt, _um, summary as fsp_summa
 
 os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 
-APP_NAME = "Lumerical FSP 3D Viewer & Results Analyzer"
-__version__ = "1.0.0"
+# ======================================================================
+# Application parameters - edit these to customise the app
+# ======================================================================
+APP_NAME = "FSP Viewer"         # Window title, name of the installed application and (macOS) menu-bar name
+APP_VERSION = "0.1.0"           # See the version history in README.md
+APP_DESCRIPTION = "Lumerical FSP 3D Viewer & Results Analyzer"
+APP_SLUG = "fsp_viewer"         # Folder and file names of the installation
+APP_CLASS = "Fsp_viewer"        # Window class (Linux: connects the windows to the menu entry)
+APP_ID = "hu.feti.fsp-viewer"   # What macOS calls the program among its own
+
+APP_ICON_YELLOW = "#ffd700"     # The icon: a black square on a yellow background
+APP_ICON_BLACK = "#000000"
+APP_ICON_SQUARE = 0.5           # Side of the black square, as a fraction of the yellow field
+APP_ICON_MARGIN = 0.1           # Transparent margin on each side, as a fraction of the icon size
+APP_ICON_ROUNDING = 0.20        # Corner radius, as a fraction of the yellow field
+
+# The files of the program, the main one first: installing copies them, an update downloads them
+APP_FILES = ("fsp_gui.py", "fsp_reader.py", "fsp_export.py")
+
+CONFIG_FILE = "~/.fsp_viewer.json"            # Settings file in the home folder: first start, installation
+UPDATE_REPOSITORY = "varallyay/fsp_viewer"    # GitHub project (owner/name) that publishes new versions
+APP_WEBSITE = "https://github.com/" + UPDATE_REPOSITORY
+UPDATE_CHECK_DAYS = 7           # Look for a new version this often (days); 0 = only with Help > Check for Updates
+
+__version__ = APP_VERSION
 
 # Trapezoidal integration helper (NumPy 1.x / 2.x compatible, as in fsp_plots.py)
 TRAPZ = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
@@ -2153,6 +2196,622 @@ class ParameterEditorPanel(tk.Frame):
 # ======================================================================
 # Main Application Window (fsp_gui.py)
 # ======================================================================
+# ======================================================================
+# Application icon: a black square on a yellow background
+# ======================================================================
+def app_icon_image(size=1024, margin=APP_ICON_MARGIN, rounding=APP_ICON_ROUNDING):
+    """Pillow image of the icon, size x size pixels.
+
+    macOS draws the Dock icon edge to edge, so the yellow field keeps a transparent margin
+    (a fraction of the size per side) and rounded corners, like the icons of native programs.
+    """
+    from PIL import Image, ImageDraw
+    lanczos = getattr(Image, "Resampling", Image).LANCZOS
+    margin = min(max(float(margin), 0.0), 0.45)
+    rounding = min(max(float(rounding), 0.0), 0.5)
+    ss = 4  # drawn 4x larger and scaled down, for smooth edges
+    full = size * ss
+    image = Image.new("RGBA", (full, full), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    edge = round(full * margin)
+    inner = full - 2 * edge
+    draw.rounded_rectangle((edge, edge, full - edge - 1, full - edge - 1),
+                           radius=round(rounding * inner), fill=APP_ICON_YELLOW)
+    half = inner * APP_ICON_SQUARE / 2
+    draw.rectangle((full / 2 - half, full / 2 - half, full / 2 + half - 1, full / 2 + half - 1), fill=APP_ICON_BLACK)
+    return image.resize((size, size), lanczos)
+
+
+def app_icon_photo(root, size=256, margin=APP_ICON_MARGIN):
+    """Tk image of the icon (for the window, the Dock and the dialogs), or None without Pillow."""
+    try:
+        from PIL import ImageTk
+        return ImageTk.PhotoImage(app_icon_image(size, margin), master=root)
+    except Exception:
+        return None
+
+
+def set_macos_app_name(name=APP_NAME):
+    """Best effort: make macOS call the program `name` instead of Python in the menu bar and the Dock.
+
+    Needs PyObjC (pip install pyobjc-framework-Cocoa); without it, and on other systems,
+    nothing happens. Must run before the Tk root window is created. Returns success.
+    """
+    if sys.platform != "darwin":
+        return False
+    done = False
+    try:
+        from Foundation import NSBundle
+        bundle = NSBundle.mainBundle()
+        info = bundle.localizedInfoDictionary() or bundle.infoDictionary()
+        if info is not None:
+            info["CFBundleName"] = name
+            info["CFBundleDisplayName"] = name
+            done = True
+    except Exception:
+        pass
+    try:
+        from Foundation import NSProcessInfo
+        NSProcessInfo.processInfo().setProcessName_(name)
+        done = True
+    except Exception:
+        pass
+    return done
+
+
+# ======================================================================
+# Installation on macOS and Linux
+#
+# Installing copies the program files (APP_FILES) to a fixed place and adds a launcher,
+# so the program starts like any other application, under its own name and icon:
+#   macOS   "FSP Viewer.app" in /Applications (systemwide) or ~/Applications (only for
+#           you); it appears in Launchpad and Spotlight.
+#   Linux   program files in /opt/fsp_viewer and a menu entry in
+#           /usr/local/share/applications (systemwide), or ~/.local/share/fsp_viewer and
+#           ~/.local/share/applications (only for you).
+# The launcher runs the copy with the Python interpreter that did the installation, which
+# has NumPy and matplotlib. CONFIG_FILE in the home folder records that the question at
+# the first start was answered and what was installed.
+# ======================================================================
+MAC_SYSTEM_DIR = "/Applications"
+MAC_USER_DIR = "~/Applications"
+LINUX_SYSTEM_DIRS = ("/opt", "/usr/local/share/applications")   # program files, menu entry
+LINUX_USER_DIRS = ("~/.local/share", "~/.local/share/applications")
+
+THIS_SCRIPT = os.path.realpath(__file__)
+MAIN_FILE = APP_FILES[0]
+
+
+def load_config():
+    """Settings from CONFIG_FILE; empty if the file is missing or unreadable."""
+    try:
+        with open(os.path.expanduser(CONFIG_FILE), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(config):
+    """Write the settings (via a temporary file, so a crash cannot leave half a file)."""
+    path = os.path.expanduser(CONFIG_FILE)
+    try:
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2, sort_keys=True)
+        os.replace(path + ".tmp", path)
+        return True
+    except OSError:
+        return False
+
+
+def _platform_name(platform):
+    return "macOS" if platform == "darwin" else "Linux" if platform.startswith("linux") else platform
+
+
+def install_target(systemwide, platform=None):
+    """Where an installation goes, or None on unsupported systems.
+
+    Returns a dict with 'files' (the folder that gets the program files), 'launcher' (the
+    .app bundle or the .desktop file), 'script' (the installed main program) and 'parents'
+    (the folders that must be writable).
+    """
+    platform = platform or sys.platform
+    if platform == "darwin":
+        base = os.path.expanduser(MAC_SYSTEM_DIR if systemwide else MAC_USER_DIR)
+        app = os.path.join(base, APP_NAME + ".app")
+        files = os.path.join(app, "Contents", "Resources")
+        parents = [base]
+    elif platform.startswith("linux"):
+        if systemwide:
+            files_root, menu_dir = LINUX_SYSTEM_DIRS
+        elif os.environ.get("XDG_DATA_HOME"):  # personal data folder set by the desktop
+            files_root = os.environ["XDG_DATA_HOME"]
+            menu_dir = os.path.join(files_root, "applications")
+        else:
+            files_root, menu_dir = LINUX_USER_DIRS
+        files_root, menu_dir = os.path.expanduser(files_root), os.path.expanduser(menu_dir)
+        files = os.path.join(files_root, APP_SLUG)
+        app = os.path.join(menu_dir, APP_SLUG + ".desktop")
+        parents = [files_root, menu_dir]
+    else:
+        return None
+    return {"files": files, "launcher": app, "script": os.path.join(files, MAIN_FILE), "parents": parents}
+
+
+def _can_write(path):
+    """Can this user create `path` (or write into it if it exists)?"""
+    while not os.path.exists(path):
+        parent = os.path.dirname(path)
+        if parent == path:
+            return False
+        path = parent
+    return os.access(path, os.W_OK)
+
+
+def running_installed_copy(platform=None):
+    """'systemwide' or 'user' if this program is an installed copy, otherwise None."""
+    for systemwide in (True, False):
+        target = install_target(systemwide, platform)
+        if target and os.path.realpath(target["script"]) == THIS_SCRIPT:
+            return "systemwide" if systemwide else "user"
+    return None
+
+
+def _version_tuple(version):
+    try:
+        return tuple(int(part) for part in str(version).split("."))
+    except ValueError:
+        return (0,)
+
+
+def is_newer(version, than):
+    return _version_tuple(version) > _version_tuple(than)
+
+
+def _admin_hint(option):
+    return f"    sudo {shlex.quote(sys.executable or 'python3')} {shlex.quote(THIS_SCRIPT)} {option}"
+
+
+_VERSION_RE = re.compile(r"""^APP_VERSION\s*=\s*['"]([^'"]+)['"]""", re.M)
+_FILES_RE = re.compile(r"^APP_FILES\s*=\s*(\([^)]*\))", re.M)
+
+
+def file_version(path):
+    """APP_VERSION written in a copy of the main program, or None."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            match = _VERSION_RE.search(f.read())
+        return match.group(1) if match else None
+    except OSError:
+        return None
+
+
+def program_files(source):
+    """The file names in APP_FILES of a main program given as text (a newer version may have
+    more files than this one); this version's list if they cannot be read."""
+    match = _FILES_RE.search(source)
+    try:
+        names = ast.literal_eval(match.group(1)) if match else None
+    except (ValueError, SyntaxError):
+        names = None
+    if (isinstance(names, tuple) and names and names[0] == MAIN_FILE
+            and all(isinstance(n, str) and re.fullmatch(r"[A-Za-z0-9_.-]+", n) and not n.startswith(".")
+                    for n in names)):
+        return names
+    return APP_FILES
+
+
+def install_app(systemwide, platform=None, source_dir=None, admin_option="--install-systemwide"):
+    """Install this program, or the copy in the folder `source_dir` (a downloaded update).
+    Returns (success, message)."""
+    platform = platform or sys.platform
+    source_dir = source_dir or os.path.dirname(THIS_SCRIPT)
+    main = os.path.join(source_dir, MAIN_FILE)
+    version = file_version(main) or APP_VERSION
+    try:
+        with open(main, encoding="utf-8", errors="replace") as f:
+            names = program_files(f.read())
+    except OSError:
+        names = APP_FILES
+    missing = [n for n in names if not os.path.isfile(os.path.join(source_dir, n))]
+    target = install_target(systemwide, platform)
+    if target is None:
+        return False, f"Installing is only supported on macOS and Linux, not on {_platform_name(platform)}."
+    if missing:
+        return False, f"Nothing was installed: {', '.join(missing)} is missing in {source_dir}."
+    if not all(_can_write(p) for p in target["parents"]):
+        if systemwide:
+            return False, ("Installing for all users needs administrator rights. In a terminal, run\n"
+                           f"{_admin_hint(admin_option)}\n"
+                           "or install it only for you.")
+        return False, f"Cannot write to {' or '.join(target['parents'])}; nothing was installed."
+    previous = file_version(target["script"])
+    try:
+        if platform == "darwin":
+            _install_mac(target, source_dir, names, version)
+        else:
+            _install_linux(target, source_dir, names)
+    except (OSError, subprocess.SubprocessError) as err:
+        return False, f"The installation failed: {err}"
+    # A systemwide installation replaces a personal one, so the program is not listed twice
+    other = install_target(not systemwide, platform)
+    if systemwide and os.path.lexists(other["launcher"]):
+        try:
+            _remove_installation(other)
+        except OSError:
+            pass
+    config = load_config()
+    config.update(first_start_done=True, update_declined=None, installed={
+        "version": version, "systemwide": systemwide, "launcher": target["launcher"],
+        "python": sys.executable})
+    config.setdefault("last_update_check", time.time())  # the first automatic check comes a week later
+    save_config(config)
+    scope = "for all users" if systemwide else "for you"
+    if previous and previous != version:
+        return True, f"{APP_NAME} is updated from {previous} to {version} ({scope}):\n    {target['launcher']}"
+    where = ("from Launchpad or the Applications folder" if platform == "darwin"
+             else "from the application menu (search for " + APP_NAME + ")")
+    return True, (f"{APP_NAME} {version} is installed {scope}:\n    {target['launcher']}\n"
+                  f"From now on it can be started {where}.")
+
+
+def uninstall_app(platform=None):
+    """Remove the installed copies (systemwide and personal). Returns (success, message)."""
+    platform = platform or sys.platform
+    if install_target(False, platform) is None:
+        return False, f"Installing is only supported on macOS and Linux, not on {_platform_name(platform)}."
+    removed, failed = [], []
+    for systemwide in (True, False):
+        target = install_target(systemwide, platform)
+        if not (os.path.lexists(target["launcher"]) or os.path.exists(target["script"])):
+            continue
+        try:
+            _remove_installation(target)
+            removed.append(target["launcher"])
+        except OSError:
+            failed.append(target["launcher"])
+    if failed:
+        return False, ("Removing " + ", ".join(failed) + " needs administrator rights. In a terminal, run\n"
+                       + _admin_hint("--uninstall"))
+    config = load_config()
+    config.pop("installed", None)
+    save_config(config)
+    if not removed:
+        return True, f"{APP_NAME} is not installed."
+    return True, "Removed " + ", ".join(removed) + "."
+
+
+def _remove_installation(target):
+    """Delete an installation; only folders that really contain an installed copy are removed."""
+    if os.path.isdir(target["launcher"]):          # macOS .app bundle
+        if not os.path.exists(target["script"]):
+            raise OSError(f"{target['launcher']} does not look like a {APP_NAME} installation")
+        shutil.rmtree(target["launcher"])
+        return
+    if os.path.lexists(target["launcher"]):        # Linux menu entry
+        os.remove(target["launcher"])
+        _refresh_menus(os.path.dirname(target["launcher"]))
+    if os.path.exists(target["script"]):
+        shutil.rmtree(target["files"])
+
+
+def _copy_program(source_dir, names, files):
+    os.makedirs(files, exist_ok=True)
+    for name in names:
+        src, dst = os.path.join(source_dir, name), os.path.join(files, name)
+        if os.path.exists(dst) and os.path.samefile(src, dst):
+            continue  # running the installed copy: nothing to copy
+        shutil.copyfile(src, dst)
+
+
+def _make_readable(folder):
+    """Let every user read (and enter) the installed files, whatever the umask was."""
+    for path, _dirs, files in os.walk(folder):
+        os.chmod(path, 0o755)
+        for name in files:
+            full = os.path.join(path, name)
+            os.chmod(full, 0o755 if os.access(full, os.X_OK) else 0o644)
+
+
+def _desktop_exec(args):
+    """Quote arguments for the Exec key of a .desktop file (freedesktop.org rules)."""
+    quoted = []
+    for arg in args:
+        arg = arg.replace("%", "%%")
+        if re.search(r"[\s\"'\\><~|&;$*?#()`]", arg):
+            arg = '"' + re.sub(r'(["`$\\])', r"\\\1", arg) + '"'
+        quoted.append(arg.replace("\\", "\\\\"))  # the file format escapes backslashes once more
+    return " ".join(quoted)
+
+
+def _refresh_menus(menu_dir):
+    if shutil.which("update-desktop-database"):
+        subprocess.run(["update-desktop-database", "-q", menu_dir],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
+def _install_linux(target, source_dir, names):
+    files = target["files"]
+    _copy_program(source_dir, names, files)
+    lines = ["[Desktop Entry]", "Type=Application", f"Name={APP_NAME}", "GenericName=Lumerical FSP Viewer",
+             f"Comment={APP_DESCRIPTION}",
+             "Exec=" + _desktop_exec([sys.executable or "python3", target["script"]]) + " %f"]
+    try:
+        menu_icon = os.path.join(files, APP_SLUG + ".png")
+        app_icon_image(256).save(menu_icon)
+        lines.append(f"Icon={menu_icon}")
+    except Exception:  # no Pillow: the menu entry gets the default icon
+        pass
+    lines += ["Terminal=false", "Categories=Science;Education;", f"StartupWMClass={APP_CLASS}"]
+    os.makedirs(os.path.dirname(target["launcher"]), exist_ok=True)
+    with open(target["launcher"], "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    os.chmod(target["launcher"], 0o755)
+    _make_readable(files)
+    _refresh_menus(os.path.dirname(target["launcher"]))
+
+
+def _install_mac(target, source_dir, names, version):
+    app, resources = target["launcher"], target["files"]
+    macos = os.path.join(app, "Contents", "MacOS")
+    os.makedirs(macos, exist_ok=True)
+    _copy_program(source_dir, names, resources)
+    has_icon = False
+    try:
+        app_icon_image(1024).save(os.path.join(resources, "AppIcon.icns"), format="ICNS")
+        has_icon = True
+    except Exception:  # no Pillow: the application gets the default icon
+        pass
+    executable = os.path.join(macos, APP_NAME)
+    with open(executable, "w", encoding="utf-8") as f:
+        f.write("#!/bin/sh\n"
+                f"# Starts {APP_NAME} with the Python interpreter that installed it.\n"
+                f'exec {shlex.quote(sys.executable or "python3")} "$(dirname "$0")/../Resources/{MAIN_FILE}" "$@"\n')
+    os.chmod(executable, 0o755)
+    info = {
+        "CFBundleName": APP_NAME, "CFBundleDisplayName": APP_NAME, "CFBundleExecutable": APP_NAME,
+        "CFBundleIdentifier": APP_ID,
+        "CFBundlePackageType": "APPL", "CFBundleInfoDictionaryVersion": "6.0",
+        "CFBundleShortVersionString": version, "CFBundleVersion": version,
+        "LSMinimumSystemVersion": "10.13", "NSHighResolutionCapable": True,
+        # Lumerical project files can be opened with the program (Finder: Open With)
+        "CFBundleDocumentTypes": [{"CFBundleTypeName": "Lumerical FDTD project", "CFBundleTypeRole": "Viewer",
+                                   "CFBundleTypeExtensions": ["fsp"], "LSHandlerRank": "Alternate"}],
+    }
+    if has_icon:
+        info["CFBundleIconFile"] = "AppIcon"
+    with open(os.path.join(app, "Contents", "Info.plist"), "wb") as f:
+        plistlib.dump(info, f)
+    _make_readable(app)
+    os.utime(app)  # lets Finder and Launchpad notice the change
+    lsregister = ("/System/Library/Frameworks/CoreServices.framework/Frameworks/"
+                  "LaunchServices.framework/Support/lsregister")
+    if os.path.exists(lsregister):
+        subprocess.run([lsregister, "-f", app], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
+def installed_copy(platform=None):
+    """The installation to update: {'version', 'systemwide', 'script'}, or None if not installed."""
+    recorded = (load_config().get("installed") or {}).get("systemwide")
+    for systemwide in ((True, False) if recorded else (False, True)):
+        target = install_target(systemwide, platform)
+        if target and os.path.isfile(target["script"]):
+            return {"version": file_version(target["script"]), "systemwide": systemwide,
+                    "script": target["script"]}
+    return None
+
+
+def startup_question(config, platform=None):
+    """What to ask when the program starts: 'install' at the first start, 'update' when an
+    older version is installed and this newer one runs from elsewhere, otherwise None."""
+    platform = platform or sys.platform
+    if install_target(False, platform) is None or running_installed_copy(platform):
+        return None
+    if not config.get("first_start_done"):
+        return "install"
+    installed = config.get("installed") or {}
+    if (installed and os.path.lexists(installed.get("launcher", ""))
+            and _version_tuple(installed.get("version")) < _version_tuple(APP_VERSION)
+            and config.get("update_declined") != APP_VERSION):
+        return "update"
+    return None
+
+
+# ---- updates from GitHub ---------------------------------------------------------
+# New versions are published in the GitHub project UPDATE_REPOSITORY: the program files
+# (APP_FILES) in its top folder. If the project has GitHub releases, the newest release
+# is used, otherwise the newest version of the main branch. APP_VERSION in its fsp_gui.py
+# decides whether it is newer than the installed copy.
+GITHUB_API = "https://api.github.com"
+GITHUB_RAW = "https://raw.githubusercontent.com"
+UPDATE_TIMEOUT = 15          # seconds allowed for each download
+MAX_DOWNLOAD = 5_000_000     # bytes; the largest program file is about 150 kB
+
+
+class UpdateError(Exception):
+    """No new version could be found or downloaded; the message says why."""
+
+
+def _download(url):
+    request = urllib.request.Request(url, headers={"User-Agent": f"{APP_SLUG}/{APP_VERSION}"})
+    with urllib.request.urlopen(request, timeout=UPDATE_TIMEOUT) as response:
+        data = response.read(MAX_DOWNLOAD + 1)
+    if len(data) > MAX_DOWNLOAD:
+        raise UpdateError(f"{url} is unexpectedly large; it was not used.")
+    return data
+
+
+def _connection_problem(err):
+    reason = getattr(err, "reason", err)
+    text = f"Could not connect to GitHub to look for a new version ({reason})."
+    if "CERTIFICATE_VERIFY_FAILED" in str(reason):
+        text += ("\nPython cannot check GitHub's security certificate. With Python from python.org on macOS,\n"
+                 "run 'Install Certificates.command' in its folder in Applications.")
+    return text
+
+
+def _download_program(base, name):
+    """One program file from GitHub as text; UpdateError if it is missing or not valid Python."""
+    try:
+        data = _download(base + name)
+    except urllib.error.HTTPError as err:
+        raise UpdateError(f"{base}{name} could not be downloaded (HTTP error {err.code}).") from None
+    except OSError as err:
+        raise UpdateError(_connection_problem(err)) from None
+    source = data.decode("utf-8", errors="replace")
+    if name.endswith(".py"):
+        try:
+            compile(source, name, "exec")  # a valid Python program, not e.g. an error page
+        except (SyntaxError, ValueError):
+            raise UpdateError(f"The file {name} downloaded from {base} is not a valid Python program.") from None
+    return source
+
+
+def find_latest_version():
+    """The newest version on GitHub: {'version', 'source' (the text of the main program),
+    'files' (its file names), 'base' (its folder URL)}.
+
+    Raises UpdateError when GitHub cannot be reached or the file is not a valid program.
+    """
+    ref = "HEAD"  # the main branch, used when the project has no releases
+    try:
+        release = json.loads(_download(f"{GITHUB_API}/repos/{UPDATE_REPOSITORY}/releases/latest"))
+        if isinstance(release, dict) and release.get("tag_name"):
+            ref = release["tag_name"]
+    except (OSError, ValueError, UpdateError):  # no releases (404), API limit reached, offline, ...
+        pass
+    base = f"{GITHUB_RAW}/{UPDATE_REPOSITORY}/{urllib.parse.quote(ref)}/"
+    source = _download_program(base, MAIN_FILE)
+    match = _VERSION_RE.search(source)
+    if not match:
+        raise UpdateError(f"The file {MAIN_FILE} downloaded from {base} has no version number.")
+    return {"version": match.group(1), "source": source, "files": program_files(source), "base": base}
+
+
+def update_check_interval(config):
+    """Days between the automatic looks for a new version; 0 if they are turned off."""
+    if not config.get("check_updates", True):
+        return 0
+    try:
+        return max(0, int(config.get("update_check_days", UPDATE_CHECK_DAYS)))
+    except (TypeError, ValueError):
+        return max(0, UPDATE_CHECK_DAYS)
+
+
+def every_days_text(days):
+    return "every week" if days == 7 else "every day" if days == 1 else f"every {days} days"
+
+
+def update_check_due(config, now=None):
+    """Is it time for the automatic look for a new version (see update_check_interval)?"""
+    days = update_check_interval(config)
+    if days <= 0:
+        return False
+    now = time.time() if now is None else now
+    return now - float(config.get("last_update_check") or 0) >= days * 86400
+
+
+def remember_update_check():
+    config = load_config()
+    config["last_update_check"] = time.time()
+    save_config(config)
+
+
+def install_update(latest, systemwide, platform=None):
+    """Download every file of a version found by find_latest_version and install it over the
+    installed copy. Nothing is changed unless all files arrive. Returns (success, message)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            for name in latest["files"]:
+                source = latest["source"] if name == MAIN_FILE else _download_program(latest["base"], name)
+                with open(os.path.join(tmp, name), "w", encoding="utf-8") as f:
+                    f.write(source)
+        except UpdateError as err:
+            return False, f"The update was not installed.\n\n{err}"
+        return install_app(systemwide, platform, source_dir=tmp, admin_option="--update")
+
+
+def update_installed_app(platform=None):
+    """Look for a newer version on GitHub and install it over the installed copy. Returns (success, message)."""
+    installed = installed_copy(platform)
+    if installed is None:
+        return False, (f"{APP_NAME} is not installed, so there is nothing to update. "
+                       f"Install it with: python3 {MAIN_FILE} --install")
+    try:
+        latest = find_latest_version()
+    except UpdateError as err:
+        return False, str(err)
+    remember_update_check()
+    if not is_newer(latest["version"], installed["version"]):
+        return True, (f"{APP_NAME} {installed['version']} is up to date "
+                      f"(newest version on GitHub: {latest['version']}).")
+    ok, message = install_update(latest, installed["systemwide"], platform)
+    if ok:
+        message += f"\nRestart {APP_NAME} to use version {latest['version']}."
+    return ok, message
+
+
+class AppDialog(tk.Toplevel):
+    """Modal question in the colours of the program, with its icon and a row of buttons;
+    show() returns the key of the chosen button (None if the window was closed).
+
+    checkbox is an optional (label, tkinter.BooleanVar) pair shown above the buttons.
+    """
+
+    def __init__(self, root, title, message, buttons, note="", icon=None, checkbox=None):
+        super().__init__(root)
+        T = THEME
+        self.root, self.choice, self.message = root, None, message
+        self.title(title)
+        self.resizable(False, False)
+        self.transient(root)
+        self.configure(bg=T["panel_bg"], padx=18, pady=16)
+        top = tk.Frame(self, bg=T["panel_bg"])
+        top.pack(anchor=tk.W, fill=tk.X)
+        if icon is not None:
+            label = tk.Label(top, image=icon, bg=T["panel_bg"])
+            label.image = icon  # keep a reference, or Tk shows an empty square
+            label.pack(side=tk.LEFT, anchor=tk.N, padx=(0, 16))
+        tk.Label(top, text=message, justify=tk.LEFT, wraplength=440, font=(FONT_UI, 11),
+                 bg=T["panel_bg"], fg=T["text"]).pack(side=tk.LEFT, anchor=tk.W)
+        if checkbox:
+            tk.Checkbutton(self, text=checkbox[0], variable=checkbox[1], font=(FONT_UI, 10),
+                           bg=T["panel_bg"], fg=T["text"], activebackground=T["panel_bg"],
+                           activeforeground=T["text"], selectcolor=T["entry_bg"],
+                           highlightthickness=0).pack(anchor=tk.W, pady=(14, 0))
+        row = tk.Frame(self, bg=T["panel_bg"])
+        row.pack(anchor=tk.E, pady=(16, 0))
+        self.buttons = {}
+        for i, (key, text) in enumerate(buttons):
+            self.buttons[key] = FlatButton(row, text, lambda k=key: self._choose(k),
+                                           variant="primary" if i == 0 else "secondary", bold=i == 0)
+            self.buttons[key].pack(side=tk.LEFT, padx=(8, 0))
+        if note:
+            tk.Label(self, text=note, justify=tk.LEFT, wraplength=480, font=(FONT_UI, 9),
+                     bg=T["panel_bg"], fg=T["text_muted"]).pack(anchor=tk.W, pady=(14, 0))
+        self.bind("<Return>", lambda event: self._choose(buttons[0][0]))
+        self.bind("<Escape>", lambda event: self._choose(None))
+        self.protocol("WM_DELETE_WINDOW", lambda: self._choose(None))
+
+    def _choose(self, key):
+        self.choice = key
+        self.destroy()
+
+    def show(self):
+        self.update_idletasks()  # centre over the main window
+        x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - self.winfo_reqwidth()) // 2)
+        y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - self.winfo_reqheight()) // 3)
+        self.geometry(f"+{x}+{y}")
+        try:
+            self.wait_visibility()
+            self.grab_set()
+            self.focus_set()
+        except tk.TclError:
+            pass
+        self.wait_window()
+        return self.choice
+
+
 class FSPGuiApp:
     """
     Main GUI combining:
@@ -2179,6 +2838,12 @@ class FSPGuiApp:
     def __init__(self, root, initial_fsp=None, initial_h5=None):
         self.root = root
         self.root.title(APP_NAME)
+        self.app_icon = app_icon_photo(root)  # the window and Dock icon
+        if self.app_icon is not None:
+            try:
+                self.root.iconphoto(True, self.app_icon)
+            except tk.TclError:
+                pass
         self.root.geometry("1640x960")
         self.root.minsize(1220, 740)
         self.root.configure(bg=THEME["app_bg"])
@@ -2198,7 +2863,12 @@ class FSPGuiApp:
         self._build_ui()
         self._build_menu()
 
-        if initial_fsp and os.path.isfile(initial_fsp):
+        if sys.platform == "darwin":  # a .fsp file opened with the installed application in Finder
+            try:
+                self.root.createcommand("::tk::mac::OpenDocument", lambda *paths: paths and self.open_fsp_file(paths[0]))
+            except tk.TclError:
+                pass
+        if initial_fsp:  # the file given on the command line
             self.root.after(100, lambda: self.open_fsp_file(initial_fsp, initial_h5))
 
     def _build_menu(self):
@@ -2215,6 +2885,15 @@ class FSPGuiApp:
         file_menu.add_separator()
         file_menu.add_command(label="Quit", command=self.root.quit, accelerator="Cmd+Q")
         menubar.add_cascade(label="File", menu=file_menu)
+        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label=f"About {APP_NAME}", command=self.show_about)
+        help_menu.add_command(label="Check for Updates…", command=self.check_for_update_now)
+        help_menu.add_separator()
+        help_menu.add_command(label=f"Install {APP_NAME}…", command=self.ask_install)
+        help_menu.add_command(label="Uninstall…", command=self.ask_uninstall)
+        help_menu.add_separator()
+        help_menu.add_command(label="GitHub Page", command=lambda: webbrowser.open(APP_WEBSITE))
+        menubar.add_cascade(label="Help", menu=help_menu)
         self.root.config(menu=menubar)
         self.root.bind_all("<Command-o>" if sys.platform == "darwin" else "<Control-o>", lambda e: self.browse_fsp())
 
@@ -3193,6 +3872,234 @@ class FSPGuiApp:
         self.last_exported_desc = f"{title} ({len(lines) - 3} data rows)"
 
     # ==================================================================
+    # Installation and Updates
+    # ==================================================================
+    def dialog_icon(self):
+        if getattr(self, "_dialog_icon", None) is None:
+            self._dialog_icon = app_icon_photo(self.root, 64, margin=0)
+        return self._dialog_icon
+
+    def message(self, title, text, buttons=(("ok", "OK"),), note=""):
+        return AppDialog(self.root, title, text, list(buttons), note=note, icon=self.dialog_icon()).show()
+
+    def _weekly_checkbox(self, checked):
+        """(label, variable) for the 'look for new versions' checkbox, or None if checks are off."""
+        self.weekly = None
+        days = update_check_interval(dict(load_config(), check_updates=True))
+        if days <= 0:
+            return None
+        self.weekly = tk.BooleanVar(self.root, value=checked)
+        return (f"Look for new versions on GitHub {every_days_text(days)}", self.weekly)
+
+    def startup_check(self, platform=None):
+        """At the first start ask whether to install the program; later offer to update the
+        installed copy, from this copy if it is newer, or else once a week from GitHub."""
+        platform = platform or sys.platform
+        config = load_config()
+        question = startup_question(config, platform)
+        if question is None:
+            if not config.get("first_start_done"):
+                config["first_start_done"] = True
+                save_config(config)
+            if update_check_due(config) and installed_copy(platform):
+                self.check_for_update(platform)
+            return
+        if question == "install":
+            self.ask_install(platform, first_start=True)
+            return
+        installed = config["installed"]
+        choice = AppDialog(
+            self.root, f"Update {APP_NAME}?",
+            f"{APP_NAME} {installed.get('version')} is installed on this computer.\n\n"
+            f"Update it to version {APP_VERSION}, the version you are running now?",
+            [("update", "Update"), ("later", "Not now")],
+            note="If you choose Not now, you are not asked again for this version; "
+                 f"Help > Install {APP_NAME} updates it later.", icon=self.dialog_icon()).show()
+        if choice == "update":
+            self.message(f"Update {APP_NAME}", install_app(bool(installed.get("systemwide")), platform)[1])
+        else:
+            config = load_config()
+            config["update_declined"] = APP_VERSION
+            save_config(config)
+
+    def ask_install(self, platform=None, first_start=False):
+        """Ask where to install the program (Help > Install, and the question at the first start)."""
+        platform = platform or sys.platform
+        if install_target(False, platform) is None:
+            self.message(f"Install {APP_NAME}",
+                         f"Installing is only supported on macOS and Linux, not on {_platform_name(platform)}.")
+            return
+        mac = platform == "darwin"
+        home = os.path.expanduser("~")
+
+        def place(systemwide):  # folder of the launcher, with the home folder shown as ~
+            folder = os.path.dirname(install_target(systemwide, platform)["launcher"])
+            return "~" + folder[len(home):] if folder.startswith(home + os.sep) else folder
+
+        choice = AppDialog(
+            self.root, f"Install {APP_NAME}?",
+            (f"Welcome to {APP_NAME} {APP_VERSION}!\n\n" if first_start else "")
+            + f"Install {APP_NAME} {APP_VERSION}? It is then listed in "
+            + ("Launchpad and the Applications folder" if mac else "the application menu")
+            + f" and starts like any other application, as {APP_NAME} with its own icon, without the terminal.\n\n"
+            f"Install systemwide: for all users of this computer\n    ({place(True)}"
+            + ("" if mac else ", needs administrator rights") + ")\n"
+            f"Only for me: just for your user account\n    ({place(False)})",
+            [("systemwide", "Install systemwide"), ("user", "Only for me"), ("no", "Don't install")],
+            note=("This question is asked only once. " if first_start else "")
+                 + f"Help > Install {APP_NAME} and Help > Uninstall do the same later.",
+            icon=self.dialog_icon(), checkbox=self._weekly_checkbox(load_config().get("check_updates", True))).show()
+        message = None
+        if choice in ("systemwide", "user"):
+            message = install_app(choice == "systemwide", platform)[1]
+        config = load_config()
+        config["first_start_done"] = True
+        if self.weekly is not None and choice is not None:
+            config["check_updates"] = bool(self.weekly.get())
+        save_config(config)
+        if message:
+            self.message(f"Install {APP_NAME}", message)
+
+    def ask_uninstall(self, platform=None):
+        if installed_copy(platform) is None:
+            self.message(f"Uninstall {APP_NAME}", f"{APP_NAME} is not installed.")
+            return
+        if self.message(f"Uninstall {APP_NAME}?",
+                        f"Remove the installed {APP_NAME} from this computer?\n\n"
+                        "Your .fsp files and the files you saved are not touched.",
+                        [("no", "Keep it"), ("yes", "Uninstall")]) == "yes":
+            self.message(f"Uninstall {APP_NAME}", uninstall_app(platform)[1])
+
+    def check_for_update(self, platform=None, interactive=False):
+        """Look for a new version on GitHub without blocking the window; offer it if there is one.
+
+        interactive (Help > Check for Updates): also say so when there is no new version or
+        GitHub cannot be reached, and offer a version the user skipped before.
+        """
+        result = {}
+
+        def look():  # runs in a background thread: no Tk calls here
+            try:
+                result["latest"] = find_latest_version()
+            except Exception as err:  # offline, GitHub unreachable, ...: try again at the next start
+                result["error"] = err
+
+        # Free unused Tk objects (e.g. of closed dialogs) here in the main thread: if Python's
+        # garbage collector ran into them in the background thread, Tcl would abort the program.
+        gc.collect()
+        thread = threading.Thread(target=look, daemon=True)
+        thread.start()
+
+        def wait():
+            if thread.is_alive():
+                self.root.after(200, wait)
+                return
+            if interactive:
+                self._looking_for_update = False
+                self.root.configure(cursor="")
+            if "latest" in result:
+                (self.report_update if interactive else self.offer_update)(result["latest"], platform)
+            elif interactive:
+                self.message("Check for Updates", f"Could not look for a new version.\n\n{result['error']}")
+
+        self.root.after(200, wait)
+        return thread
+
+    def check_for_update_now(self, platform=None):
+        """Help > Check for Updates: look on GitHub now and say what was found."""
+        if getattr(self, "_looking_for_update", False):
+            return None
+        self._looking_for_update = True
+        self.root.configure(cursor="watch")
+        return self.check_for_update(platform, interactive=True)
+
+    def report_update(self, latest, platform=None):
+        """Answer Help > Check for Updates: offer the new version, or say that there is none."""
+        installed = installed_copy(platform)
+        if installed is not None and is_newer(latest["version"], installed["version"]):
+            self.offer_update(latest, platform, asked=True)
+            return
+        remember_update_check()
+        if installed is None and is_newer(latest["version"], APP_VERSION):
+            choice = self.message(
+                "Check for Updates",
+                f"{APP_NAME} {latest['version']} is available on GitHub; you are using version {APP_VERSION}.\n\n"
+                f"Only an installed {APP_NAME} updates itself (Help > Install {APP_NAME}). You can also "
+                "download the new version from GitHub.", [("github", "Open GitHub Page"), ("ok", "Close")])
+            if choice == "github":
+                webbrowser.open(APP_WEBSITE)
+            return
+        current = installed["version"] if installed is not None else APP_VERSION
+        self.message("Check for Updates", f"{APP_NAME} {current} is up to date.\n\n"
+                                          f"The newest version on GitHub is {latest['version']}.")
+
+    def offer_update(self, latest, platform=None, asked=False):
+        """Ask whether to install the newer version found on GitHub; install it and offer a restart.
+
+        asked: the user chose Check for Updates, so a version skipped before is offered too.
+        """
+        remember_update_check()
+        config = load_config()
+        installed = installed_copy(platform)
+        if (installed is None or not is_newer(latest["version"], installed["version"])
+                or (not asked and config.get("skipped_version") == latest["version"])):
+            return
+        choice = AppDialog(
+            self.root, f"Update {APP_NAME}?",
+            f"A new version of {APP_NAME} is available.\n\n"
+            f"    Installed version:  {installed['version']}\n"
+            f"    New version:  {latest['version']}\n\n"
+            "Download and install it now?",
+            [("update", "Update now"), ("later", "Not now"), ("skip", "Skip this version")],
+            note=f"From github.com/{UPDATE_REPOSITORY}. Help > Check for Updates looks for a new version at any time.",
+            icon=self.dialog_icon(), checkbox=self._weekly_checkbox(config.get("check_updates", True))).show()
+        config = load_config()
+        if self.weekly is not None and choice is not None:
+            config["check_updates"] = bool(self.weekly.get())
+        if choice == "skip":
+            config["skipped_version"] = latest["version"]
+        save_config(config)
+        if choice != "update":
+            return
+        self.root.configure(cursor="watch")
+        self.root.update()
+        try:
+            ok, message = install_update(latest, installed["systemwide"], platform)
+        finally:
+            self.root.configure(cursor="")
+        if not ok:
+            self.message(f"Update {APP_NAME}", message)
+            return
+        if self.message(f"Restart {APP_NAME}?",
+                        f"{message}\n\nRestart now to use version {latest['version']}? "
+                        "The file that is open now is opened again.",
+                        [("restart", "Restart now"), ("later", "Later")]) == "restart":
+            self.restart(installed["script"])
+
+    def restart(self, script):
+        """Close the window and run `script` (the updated program) in place of this process,
+        with the files that are open now."""
+        args = [sys.executable, script]
+        if self.model is not None:
+            args.append(self.model.fsp_path)
+            if self.model.h5_path:
+                args.append(self.model.h5_path)
+        self.root.destroy()
+        os.execv(sys.executable, args)
+
+    def show_about(self):
+        installed = installed_copy()
+        where = (f"Installed version: {installed['version']}" if installed else "Not installed on this computer")
+        choice = self.message(
+            f"About {APP_NAME}",
+            f"{APP_NAME} {APP_VERSION}\n{APP_DESCRIPTION}\n\n"
+            "Views Ansys Lumerical FDTD project files (.fsp) and their monitor data (.h5) without a "
+            "Lumerical license, and saves the geometry as GDS or as a gdsfactory script.\n\n"
+            f"{where}\n{APP_WEBSITE}", [("ok", "OK"), ("github", "Open GitHub Page")])
+        if choice == "github":
+            webbrowser.open(APP_WEBSITE)
+
+    # ==================================================================
     # Save Geometry (GDS file or gdsfactory script)
     # ==================================================================
     def _show_save_geometry_menu(self):
@@ -3256,16 +4163,48 @@ class FSPGuiApp:
         )
 
 
-def main():
-    fsp_arg = sys.argv[1] if len(sys.argv) > 1 else None
-    h5_arg = sys.argv[2] if len(sys.argv) > 2 else None
-    # If launched without arguments and my_simulation.fsp exists in current folder, pre-load it for convenience
-    if fsp_arg is None and os.path.isfile("my_simulation.fsp"):
-        fsp_arg = "my_simulation.fsp"
-    root = tk.Tk()
-    FSPGuiApp(root, initial_fsp=fsp_arg, initial_h5=h5_arg)
+def main(argv=None):
+    """Start the program. --install, --install-systemwide, --uninstall and --update work without a window."""
+    import argparse
+    parser = argparse.ArgumentParser(prog=os.path.basename(THIS_SCRIPT),
+                                     description=f"{APP_NAME} {APP_VERSION} - {APP_DESCRIPTION}.")
+    parser.add_argument("fsp", nargs="?", help="Lumerical FDTD project file (.fsp) to open at once")
+    parser.add_argument("h5", nargs="?", help="its monitor field file (.h5); by default the .h5 of the same name")
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument("--install", action="store_true",
+                        help="install the application for the current user, then exit")
+    action.add_argument("--install-systemwide", action="store_true",
+                        help="install the application for all users (e.g. with sudo), then exit")
+    action.add_argument("--uninstall", action="store_true", help="remove the installed application, then exit")
+    action.add_argument("--update", action="store_true",
+                        help="install a newer version from GitHub over the installed one, then exit")
+    parser.add_argument("--version", action="version", version=f"{APP_NAME} {APP_VERSION}")
+    args, _ = parser.parse_known_args(argv)  # macOS may add an argument such as -psn_0_123 from Finder
+    if args.install or args.install_systemwide or args.uninstall or args.update:
+        if args.update:
+            ok, message = update_installed_app()
+        elif args.uninstall:
+            ok, message = uninstall_app()
+        else:
+            ok, message = install_app(args.install_systemwide)
+        print(message)
+        return 0 if ok else 1
+    # File names are relative to the folder the program was started from
+    fsp_arg = os.path.abspath(args.fsp) if args.fsp and not args.fsp.startswith("-psn") else None
+    h5_arg = os.path.abspath(args.h5) if args.h5 else None
+    try:  # started from Launchpad or Finder the current folder is '/': files would go there
+        if os.getcwd() == os.path.abspath(os.sep) or not os.access(os.getcwd(), os.W_OK):
+            os.chdir(os.path.expanduser("~"))
+    except OSError:
+        pass
+    set_macos_app_name(APP_NAME)
+    root = tk.Tk(className=APP_CLASS)
+    app = FSPGuiApp(root, initial_fsp=fsp_arg, initial_h5=h5_arg)
+    root.lift()
+    root.after(600, app.startup_check)
     root.mainloop()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
