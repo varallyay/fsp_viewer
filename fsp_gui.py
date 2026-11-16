@@ -24,7 +24,7 @@ Layout:
 
 Usage:
   python3 fsp_gui.py                       start with an empty window
-  python3 fsp_gui.py model.fsp             open model.fsp at once (and model.h5 next to it, if any)
+  python3 fsp_gui.py model.fsp             open model.fsp at once (and model.h5 or model_output.h5 next to it)
   python3 fsp_gui.py model.fsp fields.h5   open model.fsp with the monitor data of fields.h5
   python3 fsp_gui.py --install             install the application for you (--install-systemwide: for all users)
   python3 fsp_gui.py --uninstall           remove the installed application
@@ -439,23 +439,14 @@ class FSPModelData:
         self.h5_path = None
         self.h5 = None
 
-        # Auto-discover matching .h5 file if not explicitly provided
+        # Without an explicit .h5 file, look for the one that belongs to the project
+        self.h5_skipped = None   # a field file that was found but not opened, for the status line
         if h5_path and os.path.isfile(h5_path):
             self.load_h5(h5_path)
         else:
-            stem = os.path.splitext(self.fsp_path)[0]
-            candidate = stem + ".h5"
-            if os.path.isfile(candidate):
-                self.load_h5(candidate)
-            else:
-                # Also check HDF5DataFile property in DFT monitors
-                for ob in self.fsp.objects:
-                    h5_rel = ob.props.get("HDF5DataFile")
-                    if isinstance(h5_rel, str) and h5_rel:
-                        cand2 = os.path.join(os.path.dirname(self.fsp_path), os.path.basename(h5_rel))
-                        if os.path.isfile(cand2):
-                            self.load_h5(cand2)
-                            break
+            found = self._find_h5()
+            if found:
+                self.load_h5(found)
 
         self.fdtd_box = self._extract_fdtd_box()
         self.ports = self._extract_ports()
@@ -463,6 +454,32 @@ class FSPModelData:
         self.dft_monitors = self._extract_dft_monitors()
         self.structures = self._extract_structures()
         self._power_cache = None
+
+    def _find_h5(self):
+        """The field file of the project, or None. Tried in this order:
+        model.h5 next to model.fsp; the file named inside the project (a project with results
+        names it in its monitors); model_output.h5, the name Lumerical gives it, next to the
+        project or in the folder model/ (where a cloud run puts it).
+        A project without results (layout mode) names no file: a model_output.h5 found beside
+        it is left over from an earlier run and is not opened by itself."""
+        folder, stem = os.path.dirname(self.fsp_path), os.path.splitext(os.path.basename(self.fsp_path))[0]
+        candidate = os.path.join(folder, stem + ".h5")
+        if os.path.isfile(candidate):
+            return candidate
+        named = [v for v in (ob.props.get("HDF5DataFile") for ob in self.fsp.objects) if isinstance(v, str) and v]
+        for rel in dict.fromkeys(named):
+            rel = rel.replace("\\", "/")
+            for candidate in (os.path.join(folder, rel), os.path.join(folder, os.path.basename(rel))):
+                if os.path.isfile(candidate):
+                    return candidate
+        for candidate in (os.path.join(folder, stem + "_output.h5"),
+                          os.path.join(folder, stem, stem + "_output.h5")):
+            if os.path.isfile(candidate):
+                if named:
+                    return candidate
+                self.h5_skipped = candidate
+                return None
+        return None
 
     def load_h5(self, h5_path):
         if h5py is None:
@@ -652,7 +669,7 @@ class FSPModelData:
 
                 if pat_lay and pat_lay in gds_polys:
                     # Patterned waveguide core or trench layer
-                    is_core = "core" in lname.lower() or "sin" in lname.lower() or (n_pat and n_pat > 1.6)
+                    is_core = "core" in lname.lower() or "sin" in lname.lower() or bool(n_pat and n_pat > 1.6)
                     fill_c, edge_c = ("#c0392b", "#ff7675") if is_core else ("#3d7bd9", "#8fbfff")
                     for p_idx, poly in enumerate(gds_polys[pat_lay]):
                         xs = [pt[0] for pt in poly]
@@ -2277,6 +2294,9 @@ MAC_SYSTEM_DIR = "/Applications"
 MAC_USER_DIR = "~/Applications"
 LINUX_SYSTEM_DIRS = ("/opt", "/usr/local/share/applications")   # program files, menu entry
 LINUX_USER_DIRS = ("~/.local/share", "~/.local/share/applications")
+LINUX_COMMAND = "fsp_gui"                     # terminal command of an installation on Linux
+LINUX_SYSTEM_BIN = "/usr/local/bin"           # where the command goes (systemwide / only for you)
+LINUX_USER_BIN = "~/.local/bin"
 
 THIS_SCRIPT = os.path.realpath(__file__)
 MAIN_FILE = APP_FILES[0]
@@ -2332,7 +2352,10 @@ def install_target(systemwide, platform=None):
         files_root, menu_dir = os.path.expanduser(files_root), os.path.expanduser(menu_dir)
         files = os.path.join(files_root, APP_SLUG)
         app = os.path.join(menu_dir, APP_SLUG + ".desktop")
-        parents = [files_root, menu_dir]
+        bin_dir = os.path.expanduser(LINUX_SYSTEM_BIN if systemwide else LINUX_USER_BIN)
+        parents = [files_root, menu_dir, bin_dir]
+        return {"files": files, "launcher": app, "script": os.path.join(files, MAIN_FILE), "parents": parents,
+                "command": os.path.join(bin_dir, LINUX_COMMAND)}
     else:
         return None
     return {"files": files, "launcher": app, "script": os.path.join(files, MAIN_FILE), "parents": parents}
@@ -2451,6 +2474,12 @@ def install_app(systemwide, platform=None, source_dir=None, admin_option="--inst
         return True, f"{APP_NAME} is updated from {previous} to {version} ({scope}):\n    {target['launcher']}"
     where = ("from Launchpad or the Applications folder" if platform == "darwin"
              else "from the application menu (search for " + APP_NAME + ")")
+    if target.get("command"):
+        where += f",\nor from a terminal with the command  {LINUX_COMMAND}"
+        bin_dir = os.path.dirname(target["command"])
+        if not systemwide and bin_dir not in [os.path.expanduser(d) for d in os.environ.get("PATH", "").split(os.pathsep)]:
+            where += (f"\n({bin_dir} is not on your PATH: add  export PATH=\"{bin_dir}:$PATH\"  "
+                      "to ~/.bashrc and open a new terminal)")
     return True, (f"{APP_NAME} {version} is installed {scope}:\n    {target['launcher']}\n"
                   f"From now on it can be started {where}.")
 
@@ -2491,6 +2520,8 @@ def _remove_installation(target):
     if os.path.lexists(target["launcher"]):        # Linux menu entry
         os.remove(target["launcher"])
         _refresh_menus(os.path.dirname(target["launcher"]))
+    if target.get("command") and os.path.lexists(target["command"]):   # Linux terminal command
+        os.remove(target["command"])
     if os.path.exists(target["script"]):
         shutil.rmtree(target["files"])
 
@@ -2547,6 +2578,12 @@ def _install_linux(target, source_dir, names):
     with open(target["launcher"], "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
     os.chmod(target["launcher"], 0o755)
+    os.makedirs(os.path.dirname(target["command"]), exist_ok=True)
+    with open(target["command"], "w", encoding="utf-8") as f:
+        f.write("#!/bin/sh\n"
+                f"# Starts {APP_NAME} with the Python interpreter that installed it.\n"
+                f'exec {shlex.quote(sys.executable or "python3")} {shlex.quote(target["script"])} "$@"\n')
+    os.chmod(target["command"], 0o755)
     _make_readable(files)
     _refresh_menus(os.path.dirname(target["launcher"]))
 
@@ -3194,6 +3231,9 @@ class FSPGuiApp:
             return
         fsp_name = os.path.basename(self.model.fsp_path)
         h5_name = os.path.basename(self.model.h5_path) if self.model.h5_path else "no .h5"
+        if not self.model.h5_path and self.model.h5_skipped:
+            h5_name = (f"no .h5: {os.path.basename(self.model.h5_skipped)} was not opened, "
+                       "the project holds no results")
         self.file_lbl.config(
             text=f"{fsp_name}  ({h5_name})",
             fg=THEME["text"],

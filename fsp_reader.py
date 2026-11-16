@@ -214,11 +214,30 @@ class FSPFile:
         raise KeyError(name)
 
     def material_index(self, name):
-        """Refractive index of a constant-permittivity material (type 9), else None."""
+        """Refractive index (3 values: x, y, z) of a material, else None.
+
+        Constant-permittivity materials (type 9) give their index. Sampled-data materials
+        (a table of permittivity over frequency, such as "InP - Palik") give the table value
+        interpolated at the centre frequency of the simulation; this is the measured index,
+        not the fit the solver uses.
+        """
         m = self.material(name)
         eps = m.get("permittivity")
         if isinstance(eps, np.ndarray) and eps.shape == (3, 3) and m.get("type") == 9:
             return np.sqrt(np.diag(eps))
+        freq = m.get("frequency")
+        if isinstance(eps, np.ndarray) and isinstance(freq, np.ndarray) and eps.size == freq.size >= 2:
+            try:
+                f0 = float(self.get("::model::FDTD").props["globalFrequency"])
+            except (KeyError, TypeError, ValueError):
+                return None
+            freq, eps = freq.ravel().real, eps.ravel()
+            order = np.argsort(freq)
+            freq, eps = freq[order], eps[order]
+            if not freq[0] <= f0 <= freq[-1]:
+                return None
+            n = np.sqrt(np.interp(f0, freq, eps.real) + 1j * np.interp(f0, freq, eps.imag))
+            return np.full(3, n)
         return None
 
 

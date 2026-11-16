@@ -34,7 +34,7 @@ python3 fsp_gui.py model.fsp             # opens model.fsp at once
 python3 fsp_gui.py model.fsp fields.h5   # ... with the monitor data of fields.h5
 ```
 
-A file name given after `fsp_gui.py` is opened immediately. The monitor fields are looked up by themselves: `model.h5` next to `model.fsp`, or the `.h5` file named inside the project. Without an `.h5` file everything stored in the `.fsp` itself still works (geometry, settings, port modes, source pulse).
+A file name given after `fsp_gui.py` is opened immediately. The monitor fields are looked up by themselves: `model.h5` next to `model.fsp`, the `.h5` file named inside the project, or `model_output.h5` (the name Lumerical gives it) next to the project or in the folder `model/`. A project without results names no field file, so a `model_output.h5` left beside it by an earlier run is not opened by itself; **Open .h5…** still opens it. Without an `.h5` file everything stored in the `.fsp` itself still works (geometry, settings, port modes, source pulse).
 
 | Option | What it does |
 | :--- | :--- |
@@ -59,7 +59,7 @@ At the first start the viewer asks whether to install it: **systemwide**, **only
 
 - Installing copies `fsp_gui.py`, `fsp_reader.py` and `fsp_export.py` and writes a launcher that runs them with the Python interpreter that did the installation (the one that has numpy and matplotlib). Nothing is compiled.
 - **macOS**: the bundle gets the icon with a transparent margin and rounded corners (`APP_ICON_MARGIN = 0.1`, `APP_ICON_ROUNDING = 0.20`), so it has the size of native icons in the Dock and in Launchpad. `.fsp` files can be opened with it from Finder (*Open With*).
-- **Linux**: systemwide installation needs administrator rights: `sudo python3 fsp_gui.py --install-systemwide`. The menu entry opens a `.fsp` file passed to it.
+- **Linux**: systemwide installation needs administrator rights: `sudo python3 fsp_gui.py --install-systemwide`. The menu entry opens a `.fsp` file passed to it. The installation also adds the terminal command `fsp_gui` (in `/usr/local/bin`, or `~/.local/bin` for a personal installation), which is the way to start it where there is no application menu, such as WSL: `fsp_gui model.fsp`.
 - The folder you installed from can be moved or deleted afterwards. The file `~/.fsp_viewer.json` remembers that the question was answered, what is installed and when updates were last looked for.
 
 ### Updates from GitHub
