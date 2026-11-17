@@ -37,7 +37,7 @@ Usage:
   python fsp_reader.py model.fsp --npz out.npz   # every array, full size
   python fsp_reader.py model.fsp --gds out.gds   # layer-builder polygons as GDSII
 """
-import argparse, json, mmap, re, struct, sys
+import argparse, json, mmap, os, re, struct, sys
 from collections import OrderedDict
 import numpy as np
 
@@ -93,10 +93,9 @@ class LazyMatrix:
             raise IndexError(f"index {k} out of range for shape {self.shape}")
         n = int(np.prod(dims[:-1]))
         size = np.dtype(self.dtype).itemsize
-        d = self.file.data
-        arr = np.frombuffer(d, self.dtype, n, self.offset + k * n * size)
+        arr = self.file.read_array(self.offset + k * n * size, n, self.dtype)
         if self.is_complex:
-            im = np.frombuffer(d, self.dtype, n, self.offset + (self.total + k * n) * size)
+            im = self.file.read_array(self.offset + (self.total + k * n) * size, n, self.dtype)
             arr = arr + 1j * im
         else:
             arr = arr.copy()
@@ -159,6 +158,10 @@ class FSPFile:
     NODE_RE = re.compile(rb"[\xe8\xe9]\x03\x00\x00\x26\x00\x00\x00\{[0-9a-f-]{36}\}")
 
     def __init__(self, path):
+        # Result data is read with positioned reads where the system has them: the bytes land in
+        # memory only while used, while pages read through the memory map would stay counted
+        # as memory of the process.
+        self._fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0)) if hasattr(os, "pread") else None
         with open(path, "rb") as fh:
             try:
                 self.data = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
@@ -176,6 +179,9 @@ class FSPFile:
     def close(self):
         """Releases the file (arrays that view it must not be used afterwards)."""
         self._cache.clear()
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
         if isinstance(self.data, mmap.mmap):
             try:
                 self.data.close()
@@ -206,9 +212,28 @@ class FSPFile:
             return label, lazy, p
         return label, self._decode(lazy, copy=True), p
 
+    def read_array(self, offset, count, dtype):
+        """count values of dtype at offset, as a new array (positioned read), or as a view of
+        the memory map where the system has no positioned read."""
+        if self._fd is None:
+            return np.frombuffer(self.data, dtype, count, offset)
+        size = np.dtype(dtype).itemsize * count
+        buf = bytearray(size)
+        view, done = memoryview(buf), 0
+        while done < size:
+            chunk = os.pread(self._fd, min(size - done, 1 << 30), offset + done)
+            if not chunk:
+                raise FormatError(f"file ends inside the data at 0x{offset:x}")
+            view[done:done + len(chunk)] = chunk
+            done += len(chunk)
+        return np.frombuffer(buf, dtype, count)
+
     def _decode(self, m, copy):
         n = m.total * (2 if m.is_complex else 1)
-        arr = np.frombuffer(self.data, dtype=m.dtype, count=n, offset=m.offset)
+        if m.is_complex:
+            arr = self.read_array(m.offset, n, m.dtype)
+        else:
+            arr = np.frombuffer(self.data, dtype=m.dtype, count=n, offset=m.offset)
         if m.is_complex:
             c = np.empty(m.total, dtype=complex)
             c.real, c.imag = arr[:m.total], arr[m.total:]  # avoids NaN warnings from uninitialised values

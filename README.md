@@ -2,7 +2,7 @@
 
 <img src="icon.png" width="96" alt="FSP Viewer icon: a black square on a yellow background">
 
-**Version 0.1.0** — see [Version History](#version-history).
+**Version 0.2.0** — see [Version History](#version-history).
 
 View Ansys Lumerical FDTD project files (`.fsp`), plot their results and save their geometry as GDS **without a Lumerical license**, on macOS and Linux (the viewer and the command-line tools also run on Windows).
 
@@ -115,6 +115,8 @@ The plot is drawn in the large panel on the right, with the matplotlib toolbar (
 | Stored Refractive Index n(y, z) (YZ) | | The index cross-section at the port |
 | Simulated Field \|E\|² in YZ Planes | ✓ or in `.fsp` | The simulated field in the port and field-monitor planes at the chosen wavelength |
 | Power Through YZ Planes vs x & λ | ✓ or in `.fsp` | Power through the port and monitor planes along the device, relative to the first one, and its spectrum |
+| Power Spectrum at Selected Plane | ✓ or in `.fsp` | P / P_source of the selected port or monitor (all of them with *All Ports*) against λ, linear and dB; dashed: the part in the stored mode of that plane (a port's own mode, or a mode expansion monitor at the same x) |
+| S-Parameters from Power | ✓ or in `.fsp` | \|S_i1\|² = P_i / P_source of every plane, the mode-resolved \|S_i1\|², and \|S11\|² ≈ 1 − P(first plane after the source) / P_source; magnitudes only (phases are not in the powers) |
 | Power & Mode Coupling vs. Port x | ✓ | Power through each port and its overlap with the port mode |
 | Port Transmission vs. Wavelength λ | ✓ | Transmission spectrum of the ports |
 | XZ Propagation \|E\|² at y=0 (dB) | ✓ | The field along the device |
@@ -151,7 +153,7 @@ The parameters at the top of `fsp_gui.py`:
 | Parameter | Default | Meaning |
 | :--- | :--- | :--- |
 | `APP_NAME` | `"FSP Viewer"` | Window title and name of the installed application |
-| `APP_VERSION` | `"0.1.0"` | Version number; decides whether a copy on GitHub is newer |
+| `APP_VERSION` | `"0.2.0"` | Version number; decides whether a copy on GitHub is newer |
 | `APP_ICON_YELLOW`, `APP_ICON_BLACK` | `"#ffd700"`, `"#000000"` | Colours of the icon |
 | `APP_ICON_SQUARE` | `0.5` | Side of the black square, as a fraction of the yellow field |
 | `APP_ICON_MARGIN` | `0.1` | Transparent margin on each side, as a fraction of the icon size |
@@ -224,13 +226,22 @@ Nodes tagged `1000` (structures and layer-builder internals) start with a partly
 
 - There is no official specification. The format was decoded from one file saved by a recent Lumerical release, so other versions may differ.
 - The reader is read-only; it cannot write `.fsp` files.
-- Structure-group transforms (offset, rotation) are not decoded, so shapes inside a moved or rotated group are exported in their stored, group-local coordinates.
+- Of the rotations of a structure group or shape, a single one (e.g. about z) is placed exactly; for several the order of the axes is inferred, not confirmed.
 - Only rectangles and polygons are decoded; other primitives (circles, rings, waveguides, imported 3D objects) and analysis groups are listed but not exported.
 - Check your Lumerical license terms before using this on files covered by them.
 
 ---
 
 ## Version History
+
+### 0.2.0 — 2026-11-17
+- **Large files**: a project of many GB is memory-mapped instead of read; results are read when a plot needs them, a field at one wavelength alone (a 10.7 GB project opens in under a second with about 0.4 GB of memory, instead of 23 GB).
+- **Structure groups**: their children are decoded, and the translation and rotation of the groups (and the rotation of a shape) are applied, so a shifted or rotated InP coupon is shown, exported and summarised where it is.
+- **Field monitors** in y-z planes (e.g. `yz_half_out`) are shown in cyan, can be chosen like ports, and their fields are read from the `.h5` or from the `.fsp`; mode expansion monitors with any name (e.g. `monitor_TE`) are shown as ports.
+- **New results**: Power Through YZ Planes vs x & λ, Power Spectrum at Selected Plane (P / P_source, with the part in the stored mode), and S-Parameters from Power (\|S_i1\|², mode-resolved \|S_i1\|², \|S11\|² estimate).
+- **3D view**: exact drawing order (BSP tree), see-through ports (stippled fills do not work on macOS), and background slabs shown as outlines.
+- **2D views**: drawing is clipped to the axes; Zoom Core zooms on the waveguides; Shift / Ctrl+wheel zooms one axis; the header shows how much an axis is stretched; each waveguide layer has its own colour.
+- **Startup**: the window comes to the front, also over a terminal in full screen.
 
 ### 0.1.0 — 2026-11-13
 - **Version numbers** start here: `APP_VERSION` in `fsp_gui.py`, shown by `--version` and in Help > About.
