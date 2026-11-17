@@ -113,13 +113,20 @@ The plot is drawn in the large panel on the right, with the matplotlib toolbar (
 | Cross-Sections & Port Modes (n & \|E\|²) | | Refractive index and mode profile stored for each port, with the effective index |
 | Stored Port Mode \|E\|² Profile (YZ) | | The mode of the selected port |
 | Stored Refractive Index n(y, z) (YZ) | | The index cross-section at the port |
-| Simulated Port Field \|E\|² (YZ) | ✓ | The simulated field in the port plane at the chosen wavelength |
+| Simulated Field \|E\|² in YZ Planes | ✓ or in `.fsp` | The simulated field in the port and field-monitor planes at the chosen wavelength |
+| Power Through YZ Planes vs x & λ | ✓ or in `.fsp` | Power through the port and monitor planes along the device, relative to the first one, and its spectrum |
 | Power & Mode Coupling vs. Port x | ✓ | Power through each port and its overlap with the port mode |
 | Port Transmission vs. Wavelength λ | ✓ | Transmission spectrum of the ports |
 | XZ Propagation \|E\|² at y=0 (dB) | ✓ | The field along the device |
 | Top-View Layout & Taper Zoom (XY) | | The layout, and the same with y stretched |
 | Port Mode Field Components | | \|Ex\| … \|Hz\| of the stored mode |
 | Source Time Signal & Spectrum | | The pulse of the source |
+
+Besides the ports, the frequency-domain field monitors in y-z planes (e.g. `yz_input`, `yz_half_out`, … along a taper) are shown in cyan in the views and can be chosen in the **Port** list. Their fields are read from the `.h5` file or, when the project stores them itself, from the `.fsp`.
+
+Large projects (many GB of field results) are not read into memory: the file is memory-mapped, and a result is read when a plot needs it — a field at one wavelength is read alone, not the whole spectrum.
+
+Structure groups are drawn where they place their objects: the translation and rotation of a group (and the rotation of a rectangle or polygon itself) are applied, so a shifted or rotated coupon is shown as such.
 
 ### Saving the geometry
 **Save Geometry ▾** (also in the File menu) saves the structures shown in the views in one of two formats:

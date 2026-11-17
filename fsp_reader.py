@@ -37,14 +37,103 @@ Usage:
   python fsp_reader.py model.fsp --npz out.npz   # every array, full size
   python fsp_reader.py model.fsp --gds out.gds   # layer-builder polygons as GDSII
 """
-import argparse, json, re, struct, sys
+import argparse, json, mmap, re, struct, sys
+from collections import OrderedDict
 import numpy as np
 
 C0 = 299792458.0
 
+# A file of many GB is not read into memory: it is memory-mapped, and a matrix larger than
+# LAZY_BYTES stays on disk until it is used. Decoded complex matrices (which need a copy) are
+# kept in a cache of at most CACHE_BYTES, the least recently used dropped first.
+LAZY_BYTES = 1 << 20
+CACHE_BYTES = 1 << 30
+
 
 class FormatError(Exception):
     pass
+
+
+class LazyMatrix:
+    """A matrix of the file that is still on disk; FSPFile decodes it when it is used."""
+    __slots__ = ("file", "offset", "total", "dims", "is_real", "dtype")
+
+    def __init__(self, file, offset, total, dims, is_real, dtype):
+        self.file, self.offset, self.total, self.dims = file, offset, total, dims
+        self.is_real, self.dtype = is_real, dtype
+
+    @property
+    def shape(self):
+        return tuple(self.dims) if self.total else (0,)
+
+    @property
+    def size(self):
+        return self.total
+
+    @property
+    def ndim(self):
+        return len(self.shape)
+
+    @property
+    def is_complex(self):
+        return self.dtype == "<f8" and not self.is_real
+
+    @property
+    def nbytes(self):
+        return self.total * (16 if self.is_complex else np.dtype(self.dtype).itemsize)
+
+    def load(self):
+        return self.file._load_matrix(self)
+
+    def take_last(self, k):
+        """The slice [..., k] along the last axis (e.g. one frequency of a field result), read
+        alone: in column-major order it is one contiguous block of the file."""
+        dims = tuple(self.dims)
+        if not dims or not 0 <= k < dims[-1]:
+            raise IndexError(f"index {k} out of range for shape {self.shape}")
+        n = int(np.prod(dims[:-1]))
+        size = np.dtype(self.dtype).itemsize
+        d = self.file.data
+        arr = np.frombuffer(d, self.dtype, n, self.offset + k * n * size)
+        if self.is_complex:
+            im = np.frombuffer(d, self.dtype, n, self.offset + (self.total + k * n) * size)
+            arr = arr + 1j * im
+        else:
+            arr = arr.copy()
+        return arr.reshape(dims[:-1], order="F")
+
+    def __repr__(self):
+        return f"<{'complex ' if self.is_complex else ''}array {self.shape} on disk, {self.nbytes / 1e6:.1f} MB>"
+
+
+class LazyDict(dict):
+    """Property / result dictionary whose large matrices are decoded from the file on access.
+    raw_items() gives the stored values (LazyMatrix placeholders included) without reading them."""
+
+    def __getitem__(self, key):
+        v = dict.__getitem__(self, key)
+        return v.load() if isinstance(v, LazyMatrix) else v
+
+    def get(self, key, default=None):
+        return self[key] if key in self else default
+
+    def values(self):
+        return (self[k] for k in self)
+
+    def items(self):
+        return ((k, self[k]) for k in self)
+
+    def raw_items(self):
+        return dict.items(self)
+
+    def raw(self, key):
+        """The stored value: a LazyMatrix placeholder for a large matrix, not read."""
+        return dict.__getitem__(self, key)
+
+    def take_last(self, key, k):
+        """value[..., k], reading only that slice from the file when the matrix is large."""
+        v = dict.__getitem__(self, key)
+        return v.take_last(k) if isinstance(v, LazyMatrix) else np.asarray(v)[..., k]
 
 
 class FSPObject:
@@ -71,13 +160,27 @@ class FSPFile:
 
     def __init__(self, path):
         with open(path, "rb") as fh:
-            self.data = fh.read()
+            try:
+                self.data = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+            except ValueError:  # empty file
+                self.data = b""
         d = self.data
-        if not d.startswith(b"LUMERICAL file version"):
+        if d[:22] != b"LUMERICAL file version":
             raise FormatError("not a Lumerical file (bad magic)")
-        self.version = d[: d.index(b"\0")].decode()
+        self.version = d[: d.find(b"\0", 0, 200)].decode()
+        self._cache = OrderedDict()  # offset -> decoded large matrix
+        self._cache_bytes = 0
         self.materials = self._read_materials()
         self.objects = self._read_objects()
+
+    def close(self):
+        """Releases the file (arrays that view it must not be used afterwards)."""
+        self._cache.clear()
+        if isinstance(self.data, mmap.mmap):
+            try:
+                self.data.close()
+            except BufferError:  # arrays still look into the file: it closes when they are gone
+                pass
 
     # ---------- low level ----------
     def _i32(self, o):
@@ -94,15 +197,45 @@ class FSPFile:
         is_real, _ = struct.unpack_from("<2i", d, p + 8 + 4 * ndim)
         p += 4 * (4 + ndim)
         n = total * (1 if is_real or dtype == "<i4" else 2)
-        arr = np.frombuffer(d, dtype=dtype, count=n, offset=p).copy()
-        p += arr.itemsize * n
-        if dtype == "<f8" and not is_real:
-            c = np.empty(total, dtype=complex)
-            c.real, c.imag = arr[:total], arr[total:]  # avoids NaN warnings from uninitialised values
+        size = np.dtype(dtype).itemsize * n
+        if p + size > len(d):
+            raise FormatError(f"matrix at 0x{p:x} runs past the end of the file")
+        lazy = LazyMatrix(self, p, total, dims, is_real, dtype)
+        p += size
+        if size > LAZY_BYTES:
+            return label, lazy, p
+        return label, self._decode(lazy, copy=True), p
+
+    def _decode(self, m, copy):
+        n = m.total * (2 if m.is_complex else 1)
+        arr = np.frombuffer(self.data, dtype=m.dtype, count=n, offset=m.offset)
+        if m.is_complex:
+            c = np.empty(m.total, dtype=complex)
+            c.real, c.imag = arr[:m.total], arr[m.total:]  # avoids NaN warnings from uninitialised values
             arr = c
-        if total:
-            arr = arr.reshape(dims, order="F")
-        return label, arr, p
+        elif copy:
+            arr = arr.copy()
+        if m.total:
+            arr = arr.reshape(m.dims, order="F")
+        return arr
+
+    def _load_matrix(self, m):
+        """A large matrix, read now. A real one is a read-only view of the mapped file (no copy;
+        the system pages it in and out); a complex one is assembled and cached."""
+        if not m.is_complex:
+            return self._decode(m, copy=False)
+        arr = self._cache.get(m.offset)
+        if arr is not None:
+            self._cache.move_to_end(m.offset)
+            return arr
+        arr = self._decode(m, copy=False)
+        if arr.nbytes <= CACHE_BYTES:
+            self._cache[m.offset] = arr
+            self._cache_bytes += arr.nbytes
+            while self._cache_bytes > CACHE_BYTES and len(self._cache) > 1:
+                _, old = self._cache.popitem(last=False)
+                self._cache_bytes -= old.nbytes
+        return arr
 
     def _record(self, o):
         d = self.data
@@ -138,7 +271,7 @@ class FSPFile:
         if not 0 <= n < 5000:
             raise FormatError(f"bad property count at 0x{o:x}")
         o += 4
-        props = {}
+        props = LazyDict()
         for _ in range(n):
             k, v, o = self._record(o)
             props[k] = v
@@ -160,9 +293,16 @@ class FSPFile:
         return mats
 
     def _read_objects(self):
+        """Finds the object nodes. The search continues after the property block and the results
+        of each node, so the bulk data (field results of many GB) is jumped over, not scanned."""
         objs = []
-        for m in self.NODE_RE.finditer(self.data):
+        pos = getattr(self, "_materials_end", 0)
+        while True:
+            m = self.NODE_RE.search(self.data, pos)
+            if m is None:
+                break
             o = m.start()
+            pos = m.end()
             tag = self._i32(o)
             uuid = m.group()[8:].decode()
             start = o + 8 + 38
@@ -170,31 +310,34 @@ class FSPFile:
             if tag == 1001:
                 try:
                     props, end = self._props(start)
-                    results = {}
+                    pos = end
+                    results = LazyDict()
                     nres = self._i32(end); end += 4
+                    if not 0 <= nres < 10000:
+                        raise FormatError(f"bad result count at 0x{end - 4:x}")
                     for _ in range(nres):
                         label, arr, end = self._matrix_body(end)
                         results[label] = arr
+                        pos = end
                 except FormatError:
                     if props is None:
                         continue
-                    results = {}
             else:  # tag 1000: skip the undecoded blob, find the property block
                 for q in range(start, min(start + 200000, len(self.data) - 4)):
                     n = self._i32(q)
                     if 3 < n < 2000:
                         try:
-                            props, _ = self._props(q)
+                            props, end = self._props(q)
+                            pos = end
                             break
                         except FormatError:
                             pass
                 if props is None:
                     continue
-                results = {}
                 blob = self.data[start:q]
-                objs.append(FSPObject(o, tag, uuid, props, results, blob))
+                objs.append(FSPObject(o, tag, uuid, props, LazyDict(), blob))
                 continue
-            objs.append(FSPObject(o, tag, uuid, props, results))
+            objs.append(FSPObject(o, tag, uuid, props, results if results is not None else LazyDict()))
         return objs
 
     # ---------- convenience ----------
@@ -243,6 +386,8 @@ class FSPFile:
 
 # ---------------------------------------------------------------- output helpers
 def _fmt(v, n=6):
+    if isinstance(v, LazyMatrix):
+        return repr(v)
     if isinstance(v, np.ndarray):
         if v.size <= n:
             return np.array2string(v.ravel(), precision=6)
@@ -374,11 +519,154 @@ def _blob_strings(b):
     return out
 
 
-def structures(f):
-    """Decode rectangles, polygons and structure groups stored as tag-1000 objects.
+# A placement block follows the name of every shape: three rotation axes (-1 none, 0 x, 1 y, 2 z),
+# stored last-rotation-first, then a 3 x 1 matrix of the rotation angles in degrees.
+_ROTATION_RE = re.compile(rb"\x00(.{4})\x00(.{4})\x00(.{4})\x03\x00\x00\x00\x00\x03\x00\x00\x00\x02\x00\x00\x00"
+                          rb"\x03\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00", re.S)
+SHAPE_KINDS = {(6, 32): "rectangle", (11, 22): "polygon", (13, 18): "structure group"}
 
-    Returns a list of dicts with keys kind, name, material, xy (Nx2, metres, or None),
-    z (zmin, zmax) or None, script (structure groups) and offset.
+
+def _find_props(f, s, limit=200000):
+    """(offset, props, end) of the property block that follows the undecoded blob starting at s."""
+    for q in range(s, min(s + limit, len(f.data) - 4)):
+        n = f._i32(q)
+        if 3 < n < 2000:
+            try:
+                props, end = f._props(q)
+                return q, props, end
+            except FormatError:
+                pass
+    raise FormatError(f"no property block after 0x{s:x}")
+
+
+def _parse_shape(f, s, depth=0):
+    """One tag-1000 shape node at s (its blob, properties and, for a structure group, its
+    children, which are stored inline without a node header). Returns (node, end)."""
+    if depth > 64:
+        raise FormatError("structure groups nested too deep")
+    q, props, end = _find_props(f, s)
+    blob = bytes(f.data[s:q])
+    hdr = struct.unpack_from("<2i", blob, 0) if len(blob) >= 8 else (0, 0)
+    node = {"offset": s, "blob": blob, "props": props, "kind": SHAPE_KINDS.get(hdr, "unknown"), "children": []}
+    if hdr == (13, 18):
+        n = f._i32(end); end += 4
+        if not 0 <= n < 100000:
+            raise FormatError(f"bad child count at 0x{end - 4:x}")
+        for _ in range(n):
+            child, end = _parse_shape(f, end, depth + 1)
+            node["children"].append(child)
+    return node, end
+
+
+def shape_tree(f):
+    """Top-level tag-1000 shapes (rectangles, polygons, structure groups with their children)."""
+    out = []
+    for ob in f.objects:
+        if ob.tag != 1000:
+            continue
+        try:
+            node, _ = _parse_shape(f, ob.offset + 8 + 38)
+        except (FormatError, struct.error):
+            continue
+        node["object_offset"] = ob.offset
+        out.append(node)
+    return out
+
+
+def _rotation_matrix(axes, angles_deg):
+    """Rotation of a shape. The axes are stored last-rotation-first: the third entry is the first axis."""
+    r = np.eye(3)
+    for ax, ang in zip(reversed(axes), reversed(angles_deg)):
+        if ax not in (0, 1, 2) or not ang:
+            continue
+        c, s = np.cos(np.radians(ang)), np.sin(np.radians(ang))
+        i, j = [(1, 2), (2, 0), (0, 1)][ax]  # right-handed: positive angle is anticlockwise about the axis
+        m = np.eye(3)
+        m[i, i], m[i, j], m[j, i], m[j, j] = c, -s, s, c
+        r = m @ r
+    return r
+
+
+def _string_before(b, end):
+    """The length-prefixed NUL-terminated string that ends at `end`, or ''."""
+    for n in range(2, min(300, end - 4) + 1):
+        if struct.unpack_from("<i", b, end - n - 4)[0] == n and b[end - 1] == 0:
+            s = b[end - n:end - 1]
+            if all(32 <= c < 127 for c in s):
+                return s.decode()
+    return ""
+
+
+def _shape_geometry(node):
+    """Name, enabled flag, index text, own rotation and local geometry of a shape node."""
+    b, kind = node["blob"], node["kind"]
+    geo = {"name": "", "enabled": True, "index": "", "axes": (-1, -1, -1), "angles": (0.0, 0.0, 0.0),
+           "xy": None, "z": None, "center": None, "position": np.zeros(3), "script": None}
+    if len(b) >= 10:
+        geo["enabled"] = bool(struct.unpack_from("<i", b, len(b) - 9)[0])
+    m = _ROTATION_RE.search(b, 8)
+    if m:
+        geo["axes"] = tuple(struct.unpack("<i", g)[0] for g in m.groups())
+        geo["angles"] = struct.unpack_from("<3d", b, m.end())
+    strs = _blob_strings(b)
+    if kind == "structure group":
+        geo["name"] = strs[1] if len(strs) > 1 else ""
+        scripts = [x for x in strs[2:] if ";" in x]
+        geo["script"] = scripts[0] if scripts else None
+        if geo["name"]:  # the position follows the name: three (flag, double) pairs
+            key = struct.pack("<i", len(geo["name"]) + 1) + geo["name"].encode() + b"\0"
+            p = b.find(key)
+            if p >= 0:
+                p += len(key)
+                vals = []
+                for k in range(3):
+                    if p + 9 * (k + 1) > len(b) or b[p + 9 * k] not in (0, 1):
+                        break
+                    vals.append(struct.unpack_from("<d", b, p + 9 * k + 1)[0])
+                if len(vals) == 3 and all(abs(v) < 1 for v in vals):
+                    geo["position"] = np.array(vals)
+        return geo
+    if m:
+        geo["name"] = _string_before(b, m.start())
+    if kind == "rectangle":
+        _, y0, x0, y1, x1, z0, z1 = struct.unpack_from("<7d", b, 12)
+        x0, x1, y0, y1, z0, z1 = min(x0, x1), max(x0, x1), min(y0, y1), max(y0, y1), min(z0, z1), max(z0, z1)
+        geo["xy"] = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]])
+        geo["z"] = (z0, z1)
+        geo["center"] = np.array([(x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2])
+        geo["index"] = strs[0] if strs else ""
+    elif kind == "polygon" and len(b) > 40 and b[22] == 3:
+        # 00, int, 01 + double, 03 + vertex matrix, 01 + z min, 01 + z max, 02 + index text
+        p = 23
+        lbl = struct.unpack_from("<i", b, p)[0]; p += 4 + lbl
+        total, ndim = struct.unpack_from("<2i", b, p)
+        dims = struct.unpack_from(f"<{ndim}i", b, p + 8)
+        p += 4 * (4 + ndim)
+        if ndim == 2 and 2 in dims and 0 < total < 1000000:
+            xy = np.frombuffer(b, "<f8", total, p).reshape(dims, order="F")
+            xy = xy.T if dims[0] == 2 else xy
+            p += 8 * total
+            if b[p] in (0, 1) and b[p + 9] in (0, 1):
+                z0, z1 = struct.unpack_from("<d", b, p + 1)[0], struct.unpack_from("<d", b, p + 10)[0]
+                geo["z"] = (min(z0, z1), max(z0, z1))
+                p += 18
+                if b[p] == 2:
+                    n = struct.unpack_from("<i", b, p + 1)[0]
+                    geo["index"] = b[p + 5:p + 4 + n].decode("latin1")
+            geo["xy"] = np.array(xy, dtype=float)
+            # vertices are relative to the polygon position; the rotation turns about it
+            geo["center"] = np.array([0.0, 0.0, 0.0 if geo["z"] is None else sum(geo["z"]) / 2])
+    return geo
+
+
+def structures(f):
+    """Rectangles, polygons and structure groups (tag-1000 objects), placed in the model.
+
+    The translation and rotation of the enclosing structure groups and the rotation of the
+    shape itself are applied: xy (Nx2, metres) is the footprint of the placed shape and z its
+    (zmin, zmax). Each dict also has kind, name, path (group names / name), material, index,
+    enabled (False if the shape or a group above it is disabled), rotated (True if any rotation
+    applies), script (structure groups) and offset.
     Objects after the FDTD solver in the tree (internal helper shapes) are skipped.
     """
     try:
@@ -387,38 +675,38 @@ def structures(f):
         stop = len(f.data)
     by_uuid = {m.get("materialuuid"): m.get("name") for m in f.materials}
     out = []
-    for ob in f.objects:
-        if ob.tag != 1000 or ob.offset > stop or len(ob.blob) < 64:
-            continue
-        b = ob.blob
-        hdr = struct.unpack_from("<3i", b, 0)
-        strs = _blob_strings(b)
-        index = strs[0] if strs else ""
-        name = strs[1] if len(strs) > 1 else f"object_0x{ob.offset:x}"
-        uuid = ob.props.get("materialuuid", "")
-        material = by_uuid.get(uuid) or (f"<object defined dielectric> n={index}" if index else "?")
-        item = dict(kind="unknown", name=name, material=material, xy=None, z=None, script=None, offset=ob.offset)
-        if hdr[:2] == (6, 32):  # rectangle: index, then ymin xmin ymax xmax zmin zmax
-            y0, x0, y1, x1, z0, z1 = np.frombuffer(b, "<f8", 6, 20)
-            item.update(kind="rectangle", xy=np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]]), z=(z0, z1))
-        elif hdr[:2] == (11, 22):  # polygon: vertex matrix (2 x N), then z min, z max
-            p = b.find(b"\x03\x00\x00\x00\x00", 8)
-            if p > 0:
-                p += 5
-                tot, nd = struct.unpack_from("<2i", b, p)
-                dims = struct.unpack_from(f"<{nd}i", b, p + 8)
-                if nd == 2 and dims[0] == 2:
-                    q = p + 16 + 4 * nd
-                    xy = np.frombuffer(b, "<f8", tot, q).reshape(dims, order="F").T
-                    e = q + 8 * tot
-                    z = None
-                    if b[e] == 1 and b[e + 9] == 1:
-                        z = (struct.unpack_from("<d", b, e + 1)[0], struct.unpack_from("<d", b, e + 10)[0])
-                    item.update(kind="polygon", xy=xy, z=z)
-        elif hdr[:2] == (13, 18):
-            scripts = [s for s in strs[2:] if ";" in s]
-            item.update(kind="structure group", material="-", script=scripts[0] if scripts else None)
+
+    def place(node, rot, shift, enabled, path):
+        geo = _shape_geometry(node)
+        name = geo["name"] or f"object_0x{node['offset']:x}"
+        on = enabled and geo["enabled"]
+        own = _rotation_matrix(geo["axes"], geo["angles"])
+        uuid = node["props"].get("materialuuid", "")
+        material = by_uuid.get(uuid) or (f"<object defined dielectric> n={geo['index']}" if geo["index"] else "?")
+        item = dict(kind=node["kind"], name=name, path="/".join(path + [name]), material=material,
+                    index=geo["index"], xy=None, z=None, script=geo["script"], offset=node["offset"],
+                    enabled=on, rotated=bool(not np.allclose(rot, np.eye(3)) or not np.allclose(own, np.eye(3))))
+        if node["kind"] == "structure group":
+            item["material"] = "-"
+            out.append(item)
+            # children: point_parent = position + R_group @ point_child
+            for child in node["children"]:
+                place(child, rot @ own, shift + rot @ geo["position"], on, path + [name])
+            return
+        if geo["xy"] is not None and geo["z"] is not None:
+            c = geo["center"]
+            z0, z1 = geo["z"]
+            prism = np.array([[x, y, z] for z in (z0, z1) for x, y in geo["xy"]])
+            placed = (rot @ (c[:, None] + own @ (prism.T - c[:, None]))).T + shift
+            n = len(geo["xy"])
+            item["xy"] = placed[:n, :2]
+            item["z"] = (float(placed[:, 2].min()), float(placed[:, 2].max()))
         out.append(item)
+
+    for node in shape_tree(f):
+        if node.get("object_offset", node["offset"]) > stop:
+            continue
+        place(node, np.eye(3), np.zeros(3), True, [])
     return out
 
 
@@ -538,6 +826,10 @@ def gds_layer_map(f):
 
 
 def to_jsonable(v, max_elems):
+    if isinstance(v, LazyMatrix):
+        if v.size > max_elems:
+            return f"<array shape={v.shape} dtype={'complex128' if v.is_complex else v.dtype}>"
+        v = v.load()
     if isinstance(v, (bytes, bytearray)):
         return f"<{len(v)} bytes>"
     if isinstance(v, np.ndarray):
@@ -567,9 +859,9 @@ def main():
     elif a.props:
         for ob in f.find(a.props):
             print(f"== {ob.name}  (uuid {ob.uuid}, offset 0x{ob.offset:x})")
-            for k, v in ob.props.items():
+            for k, v in ob.props.raw_items():
                 print(f"   {k:45s} {_fmt(v)}")
-            for k, v in ob.results.items():
+            for k, v in ob.results.raw_items():
                 print(f"   [result] {k:36s} {_fmt(v)}")
     elif a.materials:
         for m in f.materials:
@@ -583,8 +875,8 @@ def main():
         doc = {"version": f.version,
                "materials": [{k: to_jsonable(v, a.max_elems) for k, v in m.items()} for m in f.materials],
                "objects": [{"name": ob.name, "uuid": ob.uuid, "offset": ob.offset,
-                            "props": {k: to_jsonable(v, a.max_elems) for k, v in ob.props.items()},
-                            "results": {k: to_jsonable(v, a.max_elems) for k, v in ob.results.items()}}
+                            "props": {k: to_jsonable(v, a.max_elems) for k, v in ob.props.raw_items()},
+                            "results": {k: to_jsonable(v, a.max_elems) for k, v in ob.results.raw_items()}}
                            for ob in f.objects]}
         with open(a.json, "w") as fh:
             json.dump(doc, fh, indent=1)
@@ -603,8 +895,8 @@ def main():
                     with open(fn, "w") as fh:
                         fh.write(st["script"])
                     print(f"  saved script of '{st['name']}' to {fn}", file=sys.stderr)
-            print("  note: objects inside structure groups are exported in their stored coordinates; "
-                  "group offsets/rotations are not applied.", file=sys.stderr)
+            print("  note: objects inside structure groups are exported where the groups place them "
+                  "(group translation and rotation applied).", file=sys.stderr)
     if a.npz:
         arrays = {}
         for ob in f.objects:

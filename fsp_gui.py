@@ -73,7 +73,8 @@ from matplotlib.figure import Figure
 from matplotlib.patches import Polygon as MplPolygon, Rectangle as MplRectangle
 
 import fsp_export
-from fsp_reader import C0, FSPFile, FormatError, _fmt, _um, summary as fsp_summary
+from fsp_reader import C0, FSPFile, FormatError, LazyMatrix, _fmt, _um, summary as fsp_summary
+from fsp_reader import structures as fsp_structures
 
 os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 
@@ -141,6 +142,8 @@ THEME = {
     "port_yellow": "#ffd700",       # Primary yellow for ports
     "port_yellow_bright": "#ffee55", # Highlighted / selected port yellow
     "port_yellow_fill": "#594b00",   # Dark translucent-like yellow fill for 2D/3D port planes
+    "monitor_cyan": "#3fc9ec",       # Field monitors in y-z planes (fields recorded along the device)
+    "monitor_cyan_bright": "#a8ecff",
     "fdtd_orange": "#ff922b",
 }
 
@@ -274,159 +277,328 @@ def extruded_poly_faces_3d(xy_pts, z0, z1, color, tag="solid"):
     return faces
 
 
+def core_y_window(structures, pad=1.8, min_half=0.6):
+    """(lo, hi) y range around the narrow waveguide cores. Wide core blocks (an InP slab of an EAM)
+    are left out, so that the window is a real zoom on the waveguides."""
+    cores = [s for s in structures if s.get("is_core")]
+    if not cores:
+        return -min_half, min_half
+    spans = sorted(s["ymax"] - s["ymin"] for s in cores)
+    limit = 4.0 * spans[len(spans) // 2]
+    narrow = [s for s in cores if s["ymax"] - s["ymin"] <= limit] or cores
+    lo = min(s["ymin"] for s in narrow)
+    hi = max(s["ymax"] for s in narrow)
+    mid, half = 0.5 * (lo + hi), max(min_half, 0.5 * (hi - lo) * pad)
+    return mid - half, mid + half
+
+
+# ----------------------------------------------------------------------
+# 2D clipping (the canvas does not clip items to the plot area by itself)
+# ----------------------------------------------------------------------
+def clip_polygon_to_rect(pts, x0, y0, x1, y1):
+    """Sutherland-Hodgman clip of a polygon [(x, y), ...] to the rectangle [x0, x1] x [y0, y1]."""
+    for axis, bound, keep_above in ((0, x0, True), (0, x1, False), (1, y0, True), (1, y1, False)):
+        if not pts:
+            break
+        out = []
+        for i, a in enumerate(pts):
+            b = pts[(i + 1) % len(pts)]
+            a_in = a[axis] >= bound if keep_above else a[axis] <= bound
+            b_in = b[axis] >= bound if keep_above else b[axis] <= bound
+            if a_in:
+                out.append(a)
+            if a_in != b_in:
+                t = (bound - a[axis]) / (b[axis] - a[axis])
+                out.append((a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])))
+        pts = out
+    return pts
+
+
+def clip_segment_to_rect(xa, ya, xb, yb, x0, y0, x1, y1):
+    """Liang-Barsky clip of a segment; (xa, ya, xb, yb) of the visible part, or None."""
+    t0, t1 = 0.0, 1.0
+    dx, dy = xb - xa, yb - ya
+    for p, q in ((-dx, xa - x0), (dx, x1 - xa), (-dy, ya - y0), (dy, y1 - ya)):
+        if p == 0:
+            if q < 0:
+                return None
+            continue
+        t = q / p
+        if p < 0:
+            t0 = max(t0, t)
+        else:
+            t1 = min(t1, t)
+        if t0 > t1:
+            return None
+    return xa + t0 * dx, ya + t0 * dy, xa + t1 * dx, ya + t1 * dy
+
+
+# ----------------------------------------------------------------------
+# BSP tree: exact back-to-front order of the 3D faces for the painter's algorithm.
+# Sorting faces by their mean depth fails for faces of very different size (a long slab
+# next to a small port plane) and for faces that cut through each other (a port plane through
+# the BOX); the BSP tree splits such faces, so that every fragment is drawn in the right order.
+# ----------------------------------------------------------------------
+BSP_EPS = 1e-7
+
+
+def polygon_plane(verts):
+    """(unit normal, offset) of a planar polygon (Newell's method, right-hand rule), or None if degenerate."""
+    nx = ny = nz = 0.0
+    n = len(verts)
+    for i in range(n):
+        x0, y0, z0 = verts[i]
+        x1, y1, z1 = verts[(i + 1) % n]
+        nx += (y0 - y1) * (z0 + z1)
+        ny += (z0 - z1) * (x0 + x1)
+        nz += (x0 - x1) * (y0 + y1)
+    length = math.sqrt(nx * nx + ny * ny + nz * nz)
+    if length < 1e-12:
+        return None
+    nx, ny, nz = nx / length, ny / length, nz / length
+    cx = sum(v[0] for v in verts) / n
+    cy = sum(v[1] for v in verts) / n
+    cz = sum(v[2] for v in verts) / n
+    return (nx, ny, nz), nx * cx + ny * cy + nz * cz
+
+
+def _plane_dist(plane, p):
+    (nx, ny, nz), d = plane
+    return nx * p[0] + ny * p[1] + nz * p[2] - d
+
+
+def convex_pieces(verts, edges, normal):
+    """Splits a planar polygon into convex pieces (ear clipping when it is concave).
+    `edges[i]` tells whether the edge verts[i] -> verts[i+1] is a real outline edge;
+    the diagonals added here are not."""
+    n = len(verts)
+
+    def turn(a, b, c):
+        ux, uy, uz = b[0] - a[0], b[1] - a[1], b[2] - a[2]
+        vx, vy, vz = c[0] - b[0], c[1] - b[1], c[2] - b[2]
+        return (normal[0] * (uy * vz - uz * vy) + normal[1] * (uz * vx - ux * vz)
+                + normal[2] * (ux * vy - uy * vx))
+
+    if all(turn(verts[i - 1], verts[i], verts[(i + 1) % n]) >= -1e-12 for i in range(n)):
+        return [(list(verts), list(edges))]
+
+    def inside(p, a, b, c):
+        return turn(a, b, p) >= 0 and turn(b, c, p) >= 0 and turn(c, a, p) >= 0
+
+    idx = list(range(n))
+    # real outline edge between original vertices i -> j (j follows i in the original polygon)
+    real = {(i, (i + 1) % n): edges[i] for i in range(n)}
+    pieces = []
+    guard = 0
+    while len(idx) > 3 and guard < 10 * n:
+        guard += 1
+        m = len(idx)
+        for k in range(m):
+            ia, ib, ic = idx[k - 1], idx[k], idx[(k + 1) % m]
+            a, b, c = verts[ia], verts[ib], verts[ic]
+            if turn(a, b, c) <= 1e-12:
+                continue
+            if any(inside(verts[j], a, b, c) for j in idx if j not in (ia, ib, ic)):
+                continue
+            pieces.append(([a, b, c], [real.get((ia, ib), False), real.get((ib, ic), False),
+                                       real.get((ic, ia), False)]))
+            real[(ia, ic)] = False
+            idx.pop(k)
+            break
+        else:
+            break
+    if len(idx) >= 3:
+        m = len(idx)
+        pieces.append(([verts[i] for i in idx], [real.get((idx[k], idx[(k + 1) % m]), False) for k in range(m)]))
+    return pieces
+
+
+class BSPNode:
+    __slots__ = ("plane", "polys", "segs", "front", "back")
+
+    def __init__(self, plane=None):
+        self.plane = plane
+        self.polys = []
+        self.segs = []
+        self.front = None
+        self.back = None
+
+
+def _split_polygon(poly, plane):
+    """Splits poly = {"v", "e", ...} by the plane into (front, back); either may be None."""
+    verts, edges = poly["v"], poly["e"]
+    dist = [_plane_dist(plane, v) for v in verts]
+    side = [0 if abs(d) < BSP_EPS else (1 if d > 0 else -1) for d in dist]
+    front, fe, back, be = [], [], [], []
+    n = len(verts)
+    for i in range(n):
+        j = (i + 1) % n
+        a, sa, sb = verts[i], side[i], side[j]
+        if sa >= 0:
+            front.append(a)
+            fe.append(edges[i])
+        if sa <= 0:
+            back.append(a)
+            be.append(edges[i])
+        if sa * sb < 0:
+            b = verts[j]
+            t = dist[i] / (dist[i] - dist[j])
+            p = (a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]), a[2] + t * (b[2] - a[2]))
+            front.append(p)
+            fe.append(edges[i])
+            back.append(p)
+            be.append(edges[i])
+
+    def finish(vs, es):
+        if len(vs) < 3:
+            return None
+        # the cut edge (both ends on the splitting plane) is not an outline edge of the face
+        m = len(vs)
+        es = [es[k] and not (abs(_plane_dist(plane, vs[k])) < BSP_EPS
+                             and abs(_plane_dist(plane, vs[(k + 1) % m])) < BSP_EPS) for k in range(m)]
+        if polygon_plane(vs) is None:
+            return None
+        return dict(poly, v=vs, e=es)
+
+    return finish(front, fe), finish(back, be)
+
+
+def build_bsp(polys, segs):
+    """BSP tree of convex polygons {"v": verts, "e": edge flags, "plane": (n, d), ...}
+    and line segments {"a": p, "b": q, ...}."""
+    if not polys:
+        if not segs:
+            return None
+        node = BSPNode()
+        node.segs = segs
+        return node
+
+    # Splitter: the face that cuts the fewest others (balanced between both sides)
+    if len(polys) <= 48:
+        candidates = polys
+    else:
+        step = len(polys) / 48.0
+        candidates = [polys[int(k * step)] for k in range(48)]
+    best, best_score = candidates[0], None
+    for cand in candidates:
+        plane = cand["plane"]
+        n_front = n_back = n_split = 0
+        for p in polys:
+            ds = [_plane_dist(plane, v) for v in p["v"]]
+            has_f = any(d > BSP_EPS for d in ds)
+            has_b = any(d < -BSP_EPS for d in ds)
+            if has_f and has_b:
+                n_split += 1
+            elif has_f:
+                n_front += 1
+            elif has_b:
+                n_back += 1
+        score = 8 * n_split + abs(n_front - n_back)
+        if best_score is None or score < best_score:
+            best, best_score = cand, score
+            if score == 0:
+                break
+
+    node = BSPNode(best["plane"])
+    front, back, front_segs, back_segs = [], [], [], []
+    for p in polys:
+        ds = [_plane_dist(node.plane, v) for v in p["v"]]
+        has_f = any(d > BSP_EPS for d in ds)
+        has_b = any(d < -BSP_EPS for d in ds)
+        if not has_f and not has_b:
+            node.polys.append(p)
+        elif not has_b:
+            front.append(p)
+        elif not has_f:
+            back.append(p)
+        else:
+            f, b = _split_polygon(p, node.plane)
+            if f:
+                front.append(f)
+            if b:
+                back.append(b)
+    for s in segs:
+        da, db = _plane_dist(node.plane, s["a"]), _plane_dist(node.plane, s["b"])
+        if abs(da) < BSP_EPS and abs(db) < BSP_EPS:
+            node.segs.append(s)
+        elif da >= -BSP_EPS and db >= -BSP_EPS:
+            front_segs.append(s)
+        elif da <= BSP_EPS and db <= BSP_EPS:
+            back_segs.append(s)
+        else:
+            t = da / (da - db)
+            a, b = s["a"], s["b"]
+            p = (a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]), a[2] + t * (b[2] - a[2]))
+            first, second = dict(s, b=p), dict(s, a=p)
+            (front_segs if da > 0 else back_segs).append(first)
+            (front_segs if db > 0 else back_segs).append(second)
+    node.front = build_bsp(front, front_segs)
+    node.back = build_bsp(back, back_segs)
+    return node
+
+
+def bsp_back_to_front(node, eye):
+    """Polygons and segments of the tree in drawing order (farthest first) as seen from `eye`.
+    Faces of closed solids that look away from the eye (back faces) are left out."""
+    out = []
+    stack = [(node, False)]
+    while stack:
+        nd, expanded = stack.pop()
+        if nd is None:
+            continue
+        if nd.plane is None:
+            out.extend(("seg", s) for s in nd.segs)
+            continue
+        if expanded:
+            for p in nd.polys:
+                if p.get("cull") and _plane_dist(p["plane"], eye) <= 0:
+                    continue
+                out.append(("poly", p))
+            out.extend(("seg", s) for s in nd.segs)
+            continue
+        near, far = (nd.front, nd.back) if _plane_dist(nd.plane, eye) > 0 else (nd.back, nd.front)
+        # popped in reverse: far subtree, then this node, then near subtree
+        stack.append((near, False))
+        stack.append((nd, True))
+        stack.append((far, False))
+    return out
+
+
 # ======================================================================
 # Scene & Data Extraction from FSPFile (and optional H5File)
 # ======================================================================
-_MATERIAL_UUID_RE = re.compile(rb"materialuuid\x00\x00\x00\x00\x00\x27\x00\x00\x00(\{[0-9a-f-]{36}\})")
-
-
-def _material_uuid_after(chunk, pos):
-    """The materialuuid property of the shape whose name ends at `pos` in a tag-1000 node."""
-    m = _MATERIAL_UUID_RE.search(chunk, pos)
-    return m.group(1).decode() if m else ""
-
-
 def _decode_tag1000_shapes(fsp):
     """
-    Recovers primitive Rectangles and 2D-extruded Polygons stored in tag-1000 nodes
-    (used in models built from primitives/structure groups such as model.fsp).
-    Does not modify fsp_reader.py.
+    Rectangles and polygons of models built from primitives / structure groups (tag-1000
+    objects), placed where the model has them: the translation and rotation of the structure
+    groups and the rotation of the shape itself are applied (fsp_reader.structures).
     """
     shapes = []
-    d = fsp.data
-
-    matches = list(FSPFile.NODE_RE.finditer(d))
-    for idx, m in enumerate(matches):
-        o = m.start()
-        tag = struct.unpack_from("<i", d, o)[0]
-        if tag != 1000:
+    for st in fsp_structures(fsp):
+        if st["xy"] is None or st["z"] is None:
             continue
-        next_o = matches[idx + 1].start() if idx + 1 < len(matches) else len(d)
-        chunk = d[o:next_o]
-
-        # Check if this node is a Structure Group (\x0d\x00\x00\x00\x12\x00\x00\x00 at 0x2e)
-        sg_enabled = 1
-        if chunk[0x2E : 0x36] == b"\x0d\x00\x00\x00\x12\x00\x00\x00":
-            first_acf = re.search(rb"\x0b\x00\x00\x00acf_custom\x00", chunk)
-            if first_acf and first_acf.start() >= 14:
-                q = first_acf.start() - 4
-                _, sg_enabled, _, _ = struct.unpack_from("<BiBi", chunk, q - 10)
-            if not sg_enabled:
-                continue
-
-        # 1. Rectangles (\x06\x00\x00\x00\x20\x00\x00\x00)
-        for rm in re.finditer(rb"\x06\x00\x00\x00\x20\x00\x00\x00", chunk):
-            try:
-                p0 = rm.start()
-                vals = struct.unpack_from("<7d", chunk, p0 + 12)
-                p = p0 + 68
-                slen = struct.unpack_from("<i", chunk, p)[0]
-                if not (0 < slen < 100):
-                    continue
-                p += 4
-                idx_str = chunk[p : p + slen].rstrip(b"\0").decode("latin1")
-                p += slen + 8
-                nlen = struct.unpack_from("<i", chunk, p)[0]
-                if not (0 < nlen < 200):
-                    continue
-                p += 4
-                name = chunk[p : p + nlen].rstrip(b"\0").decode("latin1")
-                p += nlen
-                if name == "rectangle" and idx_str == "1.0":
-                    continue
-                dx, dy, dz = struct.unpack_from("<3d", chunk, p + 44)
-                acf = re.search(rb"\x0d\x00\x00\x00CachedDecomp\x00|\x0b\x00\x00\x00acf_custom\x00", chunk[p:])
-                enabled = 1
-                if acf and acf.start() >= 14:
-                    q = p + acf.start() - 4
-                    _, enabled, _, _ = struct.unpack_from("<BiBi", chunk, q - 10)
-                ymin, xmin, ymax, xmax, zmin, zmax = [v * 1e6 for v in vals[1:]]
-                xmin += dx * 1e6
-                xmax += dx * 1e6
-                ymin += dy * 1e6
-                ymax += dy * 1e6
-                zmin += dz * 1e6
-                zmax += dz * 1e6
-                shapes.append({
-                    "kind": "rect",
-                    "name": name,
-                    "enabled": bool(enabled),
-                    "index_str": idx_str,
-                    "material_uuid": _material_uuid_after(chunk, p),
-                    "alpha": 0.5,
-                    "xmin": min(xmin, xmax),
-                    "xmax": max(xmin, xmax),
-                    "ymin": min(ymin, ymax),
-                    "ymax": max(ymin, ymax),
-                    "zmin": min(zmin, zmax),
-                    "zmax": max(zmin, zmax),
-                    "xy_poly": [(xmin, ymin), (xmax, ymin), (xmax, ymax), (xmin, ymax)],
-                })
-            except Exception:
-                continue
-
-        # 2. Extruded Polygons (\x0b\x00\x00\x00\x16\x00\x00\x00\x00)
-        for pm in re.finditer(rb"\x0b\x00\x00\x00\x16\x00\x00\x00\x00", chunk):
-            try:
-                p0 = pm.start()
-                if chunk[p0 + 22] != 3:  # 1-byte matrix tag
-                    continue
-                p = p0 + 23
-                lbl_len = struct.unpack_from("<i", chunk, p)[0]
-                if not (0 <= lbl_len < 100):
-                    continue
-                p += 4 + lbl_len
-                total, ndim = struct.unpack_from("<2i", chunk, p)
-                if not (0 < total < 10000 and ndim == 2):
-                    continue
-                dims = struct.unpack_from("<2i", chunk, p + 8)
-                p += 24
-                pts = struct.unpack_from(f"<{total}d", chunk, p)
-                p += 8 * total
-                _, z1, _, z2 = struct.unpack_from("<BdBd", chunk, p)
-                p += 18
-                _, slen = struct.unpack_from("<Bi", chunk, p)
-                p += 5
-                idx_str = chunk[p : p + slen].rstrip(b"\0").decode("latin1")
-                p += slen + 11
-                nlen = struct.unpack_from("<i", chunk, p)[0]
-                p += 4
-                name = chunk[p : p + nlen].rstrip(b"\0").decode("latin1")
-                p += nlen
-                dx, dy, dz = struct.unpack_from("<3d", chunk, p + 44)
-                # For polygons, check enabled flag right before the prop block
-                acf = re.search(rb"\x0d\x00\x00\x00CachedDecomp\x00|\x0b\x00\x00\x00acf_custom\x00", chunk[p:])
-                enabled = 1
-                if acf and acf.start() >= 14:
-                    q = p + acf.start() - 4
-                    _, enabled, _, _ = struct.unpack_from("<BiBi", chunk, q - 10)
-                n_verts = dims[1] if dims[0] == 2 else dims[0]
-                poly = [
-                    ((pts[2 * k] + dx) * 1e6, (pts[2 * k + 1] + dy) * 1e6)
-                    for k in range(n_verts)
-                ]
-                xs = [pt[0] for pt in poly]
-                ys = [pt[1] for pt in poly]
-                zmin = (min(z1, z2) + dz) * 1e6
-                zmax = (max(z1, z2) + dz) * 1e6
-                shapes.append({
-                    "kind": "poly",
-                    "name": name,
-                    "enabled": bool(enabled),
-                    "index_str": idx_str,
-                    "material_uuid": _material_uuid_after(chunk, p),
-                    "alpha": 0.5,
-                    "xmin": min(xs),
-                    "xmax": max(xs),
-                    "ymin": min(ys),
-                    "ymax": max(ys),
-                    "zmin": zmin,
-                    "zmax": zmax,
-                    "xy_poly": poly,
-                })
-            except Exception:
-                continue
-
+        if st["name"] == "rectangle" and st["index"] == "1.0":
+            continue  # helper object of the solver
+        poly = [(float(x) * 1e6, float(y) * 1e6) for x, y in st["xy"]]
+        xs = [pt[0] for pt in poly]
+        ys = [pt[1] for pt in poly]
+        shapes.append({
+            "kind": "rect" if st["kind"] == "rectangle" else "poly",
+            "name": st["name"],
+            "path": st["path"],
+            "enabled": st["enabled"],
+            "rotated": st["rotated"],
+            "index_str": st["index"],
+            "material": None if st["material"].startswith(("<object defined", "?")) else st["material"],
+            "alpha": 0.5,
+            "xmin": min(xs),
+            "xmax": max(xs),
+            "ymin": min(ys),
+            "ymax": max(ys),
+            "zmin": st["z"][0] * 1e6,
+            "zmax": st["z"][1] * 1e6,
+            "xy_poly": poly,
+        })
     return shapes
 
 
@@ -452,8 +624,10 @@ class FSPModelData:
         self.ports = self._extract_ports()
         self.mode_monitors = self._extract_mode_monitors()
         self.dft_monitors = self._extract_dft_monitors()
+        self.field_monitors = self._extract_field_monitors()
         self.structures = self._extract_structures()
         self._power_cache = None
+        self._freqs = None
 
     def _find_h5(self):
         """The field file of the project, or None. Tried in this order:
@@ -574,7 +748,9 @@ class FSPModelData:
             if "freqEHnx0" in ob.props and "yMatrix" in ob.props and "zMatrix" in ob.props:
                 p = ob.props
                 short = ob.name.split("::")[-1]
-                x = float(p.get("left", 0.0)) * 1e6
+                xb = p.get("xGridBounds")
+                placed = isinstance(xb, np.ndarray) and xb.size > 0  # empty: never put on the mesh
+                x = float(xb.ravel()[0]) * 1e6 if placed else float(p.get("left", 0.0)) * 1e6
                 ym = p["yMatrix"].ravel() * 1e6
                 zm = p["zMatrix"].ravel() * 1e6
                 mons.append({
@@ -587,9 +763,22 @@ class FSPModelData:
                     "ymax": float(ym[-1]),
                     "zmin": float(zm[0]),
                     "zmax": float(zm[-1]),
+                    "enabled": bool(p.get("enabled", 1)),
+                    "placed": placed,
                     "obj": ob,
                 })
         return mons
+
+    def port_planes(self):
+        """The ports, and the standalone mode expansion monitors (whatever their name, e.g.
+        monitor_TE): planes where the field is projected on a stored mode, drawn as ports."""
+        planes = [dict(pt, kind="port") for pt in self.ports]
+        for mm in self.mode_monitors:
+            if mm["placed"]:
+                planes.append(dict(mm, kind="mode_monitor", direction=None))
+        for i, pl in enumerate(planes):
+            pl["index"] = i
+        return planes
 
     def _extract_dft_monitors(self):
         mons = {}
@@ -601,6 +790,132 @@ class FSPModelData:
                     h5_grp = "Monitor7"
                 mons[short] = {"obj": ob, "h5_group": h5_grp}
         return mons
+
+    def _extract_field_monitors(self):
+        """
+        Frequency-domain field monitors in y-z planes, other than the DFT monitors of the ports
+        (e.g. yz_input, yz_taper_in, ... along a taper). They record the field at more places
+        along the device, and are shown and plotted like ports.
+        """
+        port_dfts = {pt["dft_obj"].name for pt in self.ports if pt["dft_obj"] is not None}
+        mons = []
+        for ob in self.fsp.objects:
+            p = ob.props
+            if ob.name in port_dfts or p.get("monitorShape") != 4 or p.get("type") != 1 or "outputEx" not in p:
+                continue
+
+            def bounds(axis):
+                v = p.get(axis + "GridBounds")
+                return np.asarray(v, float).ravel() * 1e6 if isinstance(v, np.ndarray) and v.size else None
+
+            xb, yb, zb = bounds("x"), bounds("y"), bounds("z")
+            if xb is None or yb is None or zb is None or yb.size < 2 or zb.size < 2:
+                continue  # never placed on the mesh (a disabled monitor)
+            grp = p.get("HDF5DataGroup") or None
+            in_fsp = "Ex" in ob.results
+            in_h5 = bool(grp and self.h5 is not None and grp in self.h5)
+            mons.append({
+                "name": ob.name.split("::")[-1],
+                "full_name": ob.name,
+                "kind": "monitor",
+                "x": float(xb[0]),
+                "y": 0.5 * float(yb[0] + yb[-1]),
+                "z": 0.5 * float(zb[0] + zb[-1]),
+                "ymin": float(yb[0]),
+                "ymax": float(yb[-1]),
+                "zmin": float(zb[0]),
+                "zmax": float(zb[-1]),
+                "enabled": bool(p.get("enabled", 1)),
+                "has_data": in_fsp or in_h5,
+                "obj": ob,
+                "h5_group": grp,
+            })
+        mons.sort(key=lambda m: m["x"])
+        return mons
+
+    # ---------- fields in y-z planes (ports and field monitors), from the .h5 or the .fsp ----------
+    def plane_source(self, name):
+        """Where the recorded field of a port or field monitor is: ("h5", group), ("fsp", object) or None.
+        Fields stored in the .fsp are read one frequency at a time, never as a whole."""
+        for pl in list(self.ports) + list(self.field_monitors):
+            if pl["name"] != name:
+                continue
+            grp = pl.get("h5_group")
+            if self.h5 is not None and grp and grp in self.h5:
+                return "h5", grp
+            ob = pl.get("dft_obj") if "dft_obj" in pl else pl.get("obj")
+            if ob is not None and "Ex" in ob.results:
+                return "fsp", ob
+            return None
+        return None
+
+    def field_planes(self):
+        """Names of the ports and field monitors with a recorded field, ordered along x."""
+        planes = [pl for pl in list(self.ports) + list(self.field_monitors) if self.plane_source(pl["name"])]
+        return [pl["name"] for pl in sorted(planes, key=lambda pl: pl["x"])]
+
+    def plane_grid(self, name):
+        """(x, y, z) of the field samples of a port / field monitor, in um."""
+        kind, src = self.plane_source(name)
+        if kind == "h5":  # exported in um, or by Lumerical in metres
+            g = self.h5[src]
+            x, y, z = (np.ravel(g[c][()]).astype(float) for c in "xyz")
+            scale = 1e6 if max(np.max(np.abs(y)), np.max(np.abs(z))) < 1e-2 else 1.0
+            return float(x[0]) * scale, y * scale, z * scale
+        r = src.results
+        return float(np.ravel(r["x"])[0]) * 1e6, np.ravel(r["y"]) * 1e6, np.ravel(r["z"]) * 1e6
+
+    def _plane_freq_index(self, ob, k):
+        """Index in the monitor's own frequency list of the k-th frequency of the model."""
+        if "f" not in ob.results:
+            return k
+        f_mon = np.ravel(ob.results["f"]).real
+        freqs, _, _ = self.get_frequencies_and_wavelengths()
+        if len(f_mon) == len(freqs):
+            return k
+        return int(np.argmin(np.abs(f_mon - freqs[min(k, len(freqs) - 1)])))
+
+    def plane_has(self, name, comp):
+        kind, src = self.plane_source(name)
+        return comp in (self.h5[src] if kind == "h5" else src.results)
+
+    def plane_field(self, name, comp, k):
+        """Complex field component `comp` (Ex .. Hz) of a port / field monitor at frequency index k,
+        as an (Nz, Ny) array."""
+        kind, src = self.plane_source(name)
+        if kind == "h5":
+            return self.h5_field(src, comp, k)[:, :, 0]
+        a = src.results.take_last(comp, self._plane_freq_index(src, k))  # (1, Ny, Nz)
+        return np.asarray(a)[0].T
+
+    def plane_power(self, name, k):
+        """Power through a port / field monitor plane at frequency index k: the 'power' result
+        Lumerical stored with the monitor, else the Poynting flux of the stored fields; or None."""
+        kind, src = self.plane_source(name)
+        if kind == "fsp" and "power" in src.results:
+            pw = np.ravel(src.results["power"])
+            return float(pw[self._plane_freq_index(src, k)].real)
+        if not all(self.plane_has(name, c) for c in ("Ey", "Ez", "Hy", "Hz")):
+            return None
+        _, y, z = self.plane_grid(name)
+        E = {c: self.plane_field(name, c, k) for c in ("Ey", "Ez", "Hy", "Hz")}
+        sx = np.real(E["Ey"] * np.conj(E["Hz"]) - E["Ez"] * np.conj(E["Hy"]))
+        return float(TRAPZ(TRAPZ(sx, y, axis=1), z, axis=0))
+
+    def plane_power_spectrum(self, name):
+        """The stored power through a plane at every frequency of the model, or None."""
+        src = self.plane_source(name)
+        if not src or src[0] != "fsp" or "power" not in src[1].results:
+            return None
+        pw = np.ravel(src[1].results["power"]).real
+        freqs, _, _ = self.get_frequencies_and_wavelengths()
+        if len(pw) == len(freqs):
+            return pw
+        f_mon = np.ravel(src[1].results["f"]).real if "f" in src[1].results else None
+        if f_mon is None or len(f_mon) != len(pw):
+            return None
+        order = np.argsort(f_mon)
+        return np.interp(freqs, f_mon[order], pw[order])
 
     def _extract_structures(self):
         """
@@ -639,6 +954,27 @@ class FSPModelData:
                 if lay_num and polys:
                     gds_polys[lay_num] = polys
 
+            # A layer drawn as one polygon over the whole patterned area (a BOX or a cladding given as
+            # a big rectangle in the GDS) is a background slab, not a waveguide pattern
+            all_pts = [pt for polys in gds_polys.values() for poly in polys for pt in poly]
+
+            def covers_all(polys):
+                if len(polys) != 1 or not all_pts:
+                    return False
+                xs, ys = [pt[0] for pt in polys[0]], [pt[1] for pt in polys[0]]
+                ax = max(pt[0] for pt in all_pts) - min(pt[0] for pt in all_pts)
+                ay = max(pt[1] for pt in all_pts) - min(pt[1] for pt in all_pts)
+                return max(xs) - min(xs) >= 0.9 * ax and max(ys) - min(ys) >= 0.9 * ay
+
+            slab_colors = {
+                "Si_Substrate": ("#2b303a", "#5c6470"),
+                "BOX": ("#253342", "#4a6582"),
+                "SiO2_under": ("#2c3e50", "#5d7b93"),
+                "CLAD": ("#1f3347", "#486b8a"),
+            }
+
+            core_layers = 0  # each waveguide layer gets its own color (Si and InP must be told apart)
+
             # Process layers
             for i in range(p["numProcessLayers"]):
                 k = f"{i}_process_layer"
@@ -668,9 +1004,18 @@ class FSPModelData:
                         pass
 
                 if pat_lay and pat_lay in gds_polys:
-                    # Patterned waveguide core or trench layer
-                    is_core = "core" in lname.lower() or "sin" in lname.lower() or bool(n_pat and n_pat > 1.6)
-                    fill_c, edge_c = ("#c0392b", "#ff7675") if is_core else ("#3d7bd9", "#8fbfff")
+                    # Patterned waveguide core or trench layer, or a slab drawn over the whole area
+                    is_slab = covers_all(gds_polys[pat_lay])
+                    is_core = not is_slab and (
+                        "core" in lname.lower() or "sin" in lname.lower() or bool(n_pat and n_pat > 1.6))
+                    if is_slab:
+                        fill_c, edge_c = slab_colors.get(lname, ("#28303d", "#526075"))
+                    elif is_core:
+                        # red, gold, green, purple, teal, pink (blue is for trenches, slate for slabs)
+                        fill_c, edge_c = LAYER_PALETTE[(0, 4, 2, 3, 5, 6)[core_layers % 6]]
+                        core_layers += 1
+                    else:
+                        fill_c, edge_c = ("#3d7bd9", "#8fbfff")
                     for p_idx, poly in enumerate(gds_polys[pat_lay]):
                         xs = [pt[0] for pt in poly]
                         ys = [pt[1] for pt in poly]
@@ -680,7 +1025,7 @@ class FSPModelData:
                             "gds_layer": pat_lay,
                             "material": pat_mat,
                             "n": n_pat,
-                            "is_background": False,
+                            "is_background": is_slab,
                             "is_core": is_core,
                             "xy_poly": poly,
                             "xmin": min(xs),
@@ -694,12 +1039,6 @@ class FSPModelData:
                         })
                 elif bg_mat != "-":
                     # Background slab layer (Si_Substrate, BOX, SiO2_under, CLAD)
-                    slab_colors = {
-                        "Si_Substrate": ("#2b303a", "#5c6470"),
-                        "BOX": ("#253342", "#4a6582"),
-                        "SiO2_under": ("#2c3e50", "#5d7b93"),
-                        "CLAD": ("#1f3347", "#486b8a"),
-                    }
                     fill_c, edge_c = slab_colors.get(lname, ("#28303d", "#526075"))
                     items.append({
                         "name": lname,
@@ -752,7 +1091,6 @@ class FSPModelData:
         # 2. If no Layer Builder structures were found, decode tag-1000 primitive shapes
         if not items:
             raw_shapes = _decode_tag1000_shapes(self.fsp)
-            by_uuid = {m.get("materialuuid"): m.get("name") for m in self.fsp.materials}
             core_idx = 0
             for sh in raw_shapes:
                 if not sh["enabled"]:
@@ -770,7 +1108,7 @@ class FSPModelData:
                     core_idx += 1
                 # A shape uses a material of the database, or else its own index ("object defined
                 # dielectric"); the index field is still stored, but unused, in the first case.
-                material = by_uuid.get(sh.get("material_uuid"))
+                material = sh.get("material")
                 n_val = None
                 if material:
                     try:
@@ -811,6 +1149,11 @@ class FSPModelData:
     # ------------------------------------------------------------------
     def get_frequencies_and_wavelengths(self):
         """Returns (freqs_hz, wavelengths_nm, center_idx) from DFT monitor or FDTD settings."""
+        if getattr(self, "_freqs", None) is None:
+            self._freqs = self._find_frequencies()
+        return self._freqs
+
+    def _find_frequencies(self):
         for pt in self.ports:
             dft = pt.get("dft_obj")
             if dft is not None and "f" in dft.results:
@@ -1162,7 +1505,8 @@ class ModelOrthoCanvas2D(tk.Frame):
                 size=9,
                 padx=6,
                 pady=2,
-                tooltip="Toggle y-exaggerated zoom around the waveguide core (|y| ≤ 1.2 μm)",
+                tooltip="Toggle y-exaggerated zoom around the waveguide cores\n"
+                        "(Shift+wheel zooms x only, Ctrl/⌘+wheel zooms y only)",
             )
             self.btn_zoom_core.pack(side=tk.RIGHT, padx=(0, 3), pady=3)
 
@@ -1242,14 +1586,7 @@ class ModelOrthoCanvas2D(tk.Frame):
             return
         self.exaggerate_v = not self.exaggerate_v
         if self.exaggerate_v:
-            core_ys = [
-                v
-                for st in self.model.structures
-                if st.get("is_core")
-                for v in (st["ymin"], st["ymax"])
-            ]
-            max_y = max((abs(v) for v in core_ys), default=0.5) * 2.2
-            self.v_range = [-max(max_y, 0.6), max(max_y, 0.6)]
+            self.v_range = list(core_y_window(self.model.structures))
         else:
             self.v_range = list(self.default_v_range)
         self.redraw()
@@ -1325,13 +1662,56 @@ class ModelOrthoCanvas2D(tk.Frame):
     def _on_mousewheel(self, event):
         u_c, v_c = self.px_to_uv(event.x, event.y)
         factor = 0.84 if event.delta > 0 else 1.19
+        # Shift (also a sideways trackpad swipe) zooms the horizontal axis only, Ctrl / Command
+        # the vertical one only: an axis can be stretched to make a small tilt or offset visible
+        state = getattr(event, "state", 0) or 0
+        if not isinstance(state, int):
+            state = 0
+        fu = factor if not state & 0x000C else 1.0   # Control (0x4), Command / Mod1 (0x8)
+        fv = factor if not state & 0x0001 else 1.0   # Shift
         u_min, u_max = self.u_range
         v_min, v_max = self.v_range
-        if (u_max - u_min) * factor < 1e-3 or (v_max - v_min) * factor < 1e-3:
+        if (u_max - u_min) * fu < 1e-3 or (v_max - v_min) * fv < 1e-3:
             return
-        self.u_range = [u_c - (u_c - u_min) * factor, u_c + (u_max - u_c) * factor]
-        self.v_range = [v_c - (v_c - v_min) * factor, v_c + (v_max - v_c) * factor]
+        self.u_range = [u_c - (u_c - u_min) * fu, u_c + (u_max - u_c) * fu]
+        self.v_range = [v_c - (v_c - v_min) * fv, v_c + (v_max - v_c) * fv]
         self.redraw()
+
+    def _draw_shape(self, uv_pts, fill, outline, width=1.0, dash=()):
+        """Polygon given in (u, v), clipped to the plot area. The outline is drawn only along the
+        shape's own edges, not along the border where it was cut off."""
+        x0, y0, x1, y1 = self._plot_rect()
+        px = [self.uv_to_px(u, v) for u, v in uv_pts]
+        if fill:
+            clipped = clip_polygon_to_rect(px, x0, y0, x1, y1)
+            if len(clipped) >= 3:
+                self.canvas.create_polygon(*[q for p in clipped for q in p], fill=fill, outline="")
+        if outline:
+            for i, (xa, ya) in enumerate(px):
+                xb, yb = px[(i + 1) % len(px)]
+                seg = clip_segment_to_rect(xa, ya, xb, yb, x0, y0, x1, y1)
+                if seg:
+                    self.canvas.create_line(*seg, fill=outline, width=width, dash=dash)
+
+    def _draw_box(self, u0, u1, v0, v1, fill, outline, width=1.0, dash=()):
+        self._draw_shape([(u0, v0), (u1, v0), (u1, v1), (u0, v1)], fill, outline, width, dash)
+
+    def _clipped_line(self, xa, ya, xb, yb, **kw):
+        x0, y0, x1, y1 = self._plot_rect()
+        seg = clip_segment_to_rect(xa, ya, xb, yb, x0, y0, x1, y1)
+        if seg:
+            self.canvas.create_line(*seg, **kw)
+        return seg
+
+    def _aspect_text(self):
+        """How much the vertical axis is stretched against the horizontal one, e.g. 'y ×6.3'."""
+        x0, y0, x1, y1 = self._plot_rect()
+        su = (x1 - x0) / max(1e-12, self.u_range[1] - self.u_range[0])
+        sv = (y1 - y0) / max(1e-12, self.v_range[1] - self.v_range[0])
+        ratio = sv / su
+        if 0.95 <= ratio <= 1.05:
+            return "1:1"
+        return f"{self.v_label} ×{ratio:.3g}" if ratio > 1 else f"{self.u_label} ×{1 / ratio:.3g}"
 
     def redraw(self):
         T = THEME
@@ -1397,9 +1777,11 @@ class ModelOrthoCanvas2D(tk.Frame):
             )
             return
 
-        n_ports = len(self.model.ports)
+        n_ports = len(self.model.port_planes())
         self.info_lbl.config(
-            text=f"{len(self.model.structures)} layers · {n_ports} ports",
+            text=f"{len(self.model.structures)} layers · {n_ports} ports"
+                 + (f" · {n_fm} monitors" if (n_fm := sum(m['has_data'] for m in self.model.field_monitors)) else "")
+                 + f" · {self._aspect_text()}",
             fg=T["port_yellow"],
         )
 
@@ -1412,78 +1794,84 @@ class ModelOrthoCanvas2D(tk.Frame):
 
         ordered_structs = sorted(self.model.structures,
                                  key=lambda s: (not s["is_background"], s["is_core"], -_view_area(s)))
+        labelled = set()  # a layer split into several shapes is labelled once
         for st in ordered_structs:
             if self.view_kind == "xy":
                 if st["is_background"] and st.get("gds_layer") == "":
                     # Subtle outline for full wafer background slab in XY
-                    px0, py1 = self.uv_to_px(st["xmin"], st["ymin"])
-                    px1, py0 = self.uv_to_px(st["xmax"], st["ymax"])
-                    c.create_rectangle(px0, py0, px1, py1, fill="", outline=st["edge"], dash=(2, 4))
-                else:
-                    coords = [coord for u, v in st["xy_poly"] for coord in self.uv_to_px(u, v)]
-                    if len(coords) >= 6:
-                        c.create_polygon(*coords, fill=st["fill"], outline=st["edge"], width=1.5)
-            elif self.view_kind == "xz":
-                px0, py1 = self.uv_to_px(st["xmin"], st["zmin"])
-                px1, py0 = self.uv_to_px(st["xmax"], st["zmax"])
-                c.create_rectangle(
-                    px0, py0, px1, py1,
-                    fill=st["fill"],
-                    outline=st["edge"],
-                    width=1.5 if st["is_core"] else 1.0,
-                )
-                if abs(py1 - py0) >= 12 and (st["is_background"] or st["is_core"]):
-                    c.create_text(
-                        max(x0 + 6, min(x1 - 40, px0 + 6)),
-                        0.5 * (py0 + py1),
-                        text=st["layer_name"],
-                        font=(FONT_UI, 8),
-                        fill=T["text_muted"] if st["is_background"] else "#ffffff",
-                        anchor="w",
-                    )
-            elif self.view_kind == "yz":
-                px0, py1 = self.uv_to_px(st["ymin"], st["zmin"])
-                px1, py0 = self.uv_to_px(st["ymax"], st["zmax"])
-                c.create_rectangle(
-                    px0, py0, px1, py1,
-                    fill=st["fill"],
-                    outline=st["edge"],
-                    width=1.6 if st["is_core"] else 1.0,
-                )
-                if st["is_background"] and abs(py1 - py0) >= 12:
-                    c.create_text(
-                        x0 + 6,
-                        0.5 * (py0 + py1),
-                        text=f"{st['layer_name']}" + (f" (n={st['n']:.3f})" if st["n"] else ""),
-                        font=(FONT_UI, 8),
-                        fill=T["text_muted"],
-                        anchor="w",
-                    )
+                    self._draw_box(st["xmin"], st["xmax"], st["ymin"], st["ymax"], "", st["edge"], dash=(2, 4))
+                elif len(st["xy_poly"]) >= 3:
+                    self._draw_shape(st["xy_poly"], st["fill"], st["edge"], width=1.5)
+                continue
+            u, v = ("x", "z") if self.view_kind == "xz" else ("y", "z")
+            self._draw_box(st[u + "min"], st[u + "max"], st["zmin"], st["zmax"], st["fill"], st["edge"],
+                           width=(1.5 if self.view_kind == "xz" else 1.6) if st["is_core"] else 1.0)
+            wants_label = st["is_background"] or (self.view_kind == "xz" and st["is_core"])
+            if not wants_label or st["layer_name"] in labelled:
+                continue
+            # label inside the visible part of the shape
+            px0, py1 = self.uv_to_px(st[u + "min"], st["zmin"])
+            px1, py0 = self.uv_to_px(st[u + "max"], st["zmax"])
+            vx0, vx1 = max(x0, min(px0, px1)), min(x1, max(px0, px1))
+            vy0, vy1 = max(y0, min(py0, py1)), min(y1, max(py0, py1))
+            if vy1 - vy0 < 12 or vx1 - vx0 < 40:
+                continue
+            labelled.add(st["layer_name"])
+            if self.view_kind == "xz":
+                text = st["layer_name"]
+                fill = T["text_muted"] if st["is_background"] else "#ffffff"
+            else:
+                text = st["layer_name"] + (f" (n={st['n']:.3f})" if st["n"] else "")
+                fill = T["text_muted"]
+            c.create_text(vx0 + 6, 0.5 * (vy0 + vy1), text=text, font=(FONT_UI, 8), fill=fill, anchor="w")
 
         # 3. Draw FDTD region in orange
         if self.model.fdtd_box:
             fx0, fx1, fy0, fy1, fz0, fz1 = self.model.fdtd_box
-            if self.view_kind == "xy":
-                rx0, ry1 = self.uv_to_px(fx0, fy0)
-                rx1, ry0 = self.uv_to_px(fx1, fy1)
-            elif self.view_kind == "xz":
-                rx0, ry1 = self.uv_to_px(fx0, fz0)
-                rx1, ry0 = self.uv_to_px(fx1, fz1)
-            else:
-                rx0, ry1 = self.uv_to_px(fy0, fz0)
-                rx1, ry0 = self.uv_to_px(fy1, fz1)
-            c.create_rectangle(rx0, ry0, rx1, ry1, fill="", outline=T["fdtd_orange"], width=1.5, dash=(5, 3))
-            c.create_text(
-                min(x1 - 4, max(x0 + 4, rx1 - 4)),
-                max(y0 + 10, ry0 + 10),
-                text="FDTD",
-                font=(FONT_UI, 8, "bold"),
-                fill=T["fdtd_orange"],
-                anchor="ne",
-            )
+            box = {"xy": (fx0, fx1, fy0, fy1), "xz": (fx0, fx1, fz0, fz1), "yz": (fy0, fy1, fz0, fz1)}[self.view_kind]
+            self._draw_box(*box, "", T["fdtd_orange"], width=1.5, dash=(5, 3))
+            rx1, ry0 = self.uv_to_px(box[1], box[3])
+            rx0, ry1 = self.uv_to_px(box[0], box[2])
+            if rx1 > x0 + 30 and rx0 < x1 and ry0 < y1 - 10 and ry1 > y0:  # label only when the box is in view
+                # bottom right corner: the port labels are at the top
+                c.create_text(
+                    min(x1 - 4, max(x0 + 30, rx1 - 4)),
+                    max(y0 + 12, min(y1 - 3, ry1 - 3)),
+                    text="FDTD",
+                    font=(FONT_UI, 8, "bold"),
+                    fill=T["fdtd_orange"],
+                    anchor="se",
+                )
 
-        # 4. Draw PORTS in YELLOW (#ffd700 / #ffee55)
-        for pt in self.model.ports:
+        # 3b. Field monitors in CYAN: y-z planes where the field is recorded along the device
+        n_mon = 0
+        for mm in self.model.field_monitors:
+            is_sel = mm["name"] == self.selected_port
+            if mm["has_data"]:
+                color, lw, dash = (T["monitor_cyan_bright"], 2.6, ()) if is_sel else (T["monitor_cyan"], 1.4, (6, 3))
+                n_mon += 1
+            else:  # disabled / no recorded field: faint
+                color, lw, dash = "#2f6f80", 1.0, (2, 3)
+            if self.view_kind in ("xy", "xz"):
+                lo, hi = ("ymin", "ymax") if self.view_kind == "xy" else ("zmin", "zmax")
+                px, pa = self.uv_to_px(mm["x"], mm[hi])
+                _, pb = self.uv_to_px(mm["x"], mm[lo])
+                if not (x0 <= px <= x1):
+                    continue
+                seg = self._clipped_line(px, pa, px, pb, fill=color, width=lw, dash=dash)
+                if seg and mm["has_data"]:
+                    self._port_hit_boxes.append((mm["name"], px - 5, min(seg[1], seg[3]), px + 5, max(seg[1], seg[3])))
+            elif is_sel or mm["has_data"]:  # yz: the monitors share their frame; the selected one on top
+                self._draw_box(mm["ymin"], mm["ymax"], mm["zmin"], mm["zmax"], "", color, width=lw, dash=dash)
+        if self.view_kind == "yz" and n_mon:
+            sel = next((mm for mm in self.model.field_monitors if mm["name"] == self.selected_port), None)
+            text = (f"{sel['name']} (x={sel['x']:.4g} μm)" if sel else
+                    f"{n_mon} field monitor{'s' if n_mon > 1 else ''} (cyan)")
+            c.create_text(x0 + 6, y1 - 6, text=text, font=(FONT_UI, 8, "bold"),
+                          fill=T["monitor_cyan_bright"] if sel else T["monitor_cyan"], anchor="sw")
+
+        # 4. Draw PORTS (and mode expansion monitors) in YELLOW (#ffd700 / #ffee55)
+        for pt in self.model.port_planes():
             is_sel = (pt["name"] == self.selected_port) or (self.selected_port == "All Ports")
             p_color = T["port_yellow_bright"] if pt["name"] == self.selected_port else T["port_yellow"]
             lw = 3.0 if pt["name"] == self.selected_port else 2.0
@@ -1491,45 +1879,33 @@ class ModelOrthoCanvas2D(tk.Frame):
                 p_color, lw = "#8a7a1a", 1.0
             short_lbl = pt["name"].replace("output_", "out").replace("input_port", "in")
 
-            if self.view_kind == "xy":
-                px, py0 = self.uv_to_px(pt["x"], pt["ymax"])
-                _, py1 = self.uv_to_px(pt["x"], pt["ymin"])
-                # Full vertical guide dash + thick yellow port span
+            if self.view_kind in ("xy", "xz"):
+                lo, hi = ("ymin", "ymax") if self.view_kind == "xy" else ("zmin", "zmax")
+                px, pa = self.uv_to_px(pt["x"], pt[hi])
+                _, pb = self.uv_to_px(pt["x"], pt[lo])
+                if not (x0 <= px <= x1):
+                    continue  # port outside the visible x range
+                # Full vertical guide dash + thick yellow port span (only the part inside the plot)
                 c.create_line(px, y0, px, y1, fill="#665800", width=1, dash=(2, 4))
-                c.create_line(px, py0, px, py1, fill=p_color, width=lw)
-                c.create_oval(px - 3, py0 - 3, px + 3, py0 + 3, fill=p_color, outline="#000000")
-                c.create_oval(px - 3, py1 - 3, px + 3, py1 + 3, fill=p_color, outline="#000000")
-                # Direction arrow at port center
-                _, pyc = self.uv_to_px(pt["x"], pt["y"])
-                arr_dx = 10 if pt["direction"] == "+" else -10
-                c.create_line(px, pyc, px + arr_dx, pyc, fill=p_color, width=2, arrow=tk.LAST)
-                self._port_hit_boxes.append((pt["name"], px - 6, min(py0, py1), px + 6, max(py0, py1)))
-
-            elif self.view_kind == "xz":
-                px, pz0 = self.uv_to_px(pt["x"], pt["zmax"])
-                _, pz1 = self.uv_to_px(pt["x"], pt["zmin"])
-                c.create_line(px, y0, px, y1, fill="#665800", width=1, dash=(2, 4))
-                c.create_line(px, pz0, px, pz1, fill=p_color, width=lw)
-                c.create_oval(px - 3, pz0 - 3, px + 3, pz0 + 3, fill=p_color, outline="#000000")
-                c.create_oval(px - 3, pz1 - 3, px + 3, pz1 + 3, fill=p_color, outline="#000000")
-                self._port_hit_boxes.append((pt["name"], px - 6, min(pz0, pz1), px + 6, max(pz0, pz1)))
+                seg = self._clipped_line(px, pa, px, pb, fill=p_color, width=lw)
+                for py in (pa, pb):
+                    if y0 <= py <= y1:
+                        c.create_oval(px - 3, py - 3, px + 3, py + 3, fill=p_color, outline="#000000")
+                if self.view_kind == "xy" and pt["direction"]:  # direction arrow at port center
+                    _, pyc = self.uv_to_px(pt["x"], pt["y"])
+                    if y0 <= pyc <= y1:
+                        arr_dx = 10 if pt["direction"] == "+" else -10
+                        c.create_line(px, pyc, px + arr_dx, pyc, fill=p_color, width=2, arrow=tk.LAST)
+                if seg:
+                    self._port_hit_boxes.append((pt["name"], px - 6, min(seg[1], seg[3]), px + 6, max(seg[1], seg[3])))
 
             else:  # yz cross-section
-                py0, pz1 = self.uv_to_px(pt["ymin"], pt["zmin"])
+                self._draw_box(pt["ymin"], pt["ymax"], pt["zmin"], pt["zmax"], "", p_color, width=lw,
+                               dash=() if is_sel else (4, 2))
                 py1, pz0 = self.uv_to_px(pt["ymax"], pt["zmax"])
-                c.create_rectangle(
-                    py0,
-                    pz0,
-                    py1,
-                    pz1,
-                    fill="",
-                    outline=p_color,
-                    width=lw,
-                    dash=() if is_sel else (4, 2),
-                )
                 c.create_text(
-                    py1 - 4,
-                    pz0 + 10 + 12 * pt["index"],  # one line per port: they share this frame
+                    min(x1, py1) - 4,
+                    max(y0, pz0) + 10 + 12 * pt["index"],  # one line per port: they share this frame
                     text=f"{pt['name']} (x={pt['x']:g} μm)" + ("" if pt["enabled"] else ", disabled"),
                     font=(FONT_UI, 8, "bold"),
                     fill=p_color,
@@ -1540,7 +1916,7 @@ class ModelOrthoCanvas2D(tk.Frame):
         if self.view_kind in ("xy", "xz"):
             last_px = -999
             row_idx = 0
-            for pt in sorted(self.model.ports, key=lambda item: item["x"]):
+            for pt in sorted(self.model.port_planes(), key=lambda item: item["x"]):
                 px, _ = self.uv_to_px(pt["x"], 0)
                 if not (x0 <= px <= x1):
                     continue
@@ -1572,6 +1948,29 @@ class ModelOrthoCanvas2D(tk.Frame):
                 )
                 c.tag_lower(bg, tid)
                 self._port_hit_boxes.append((pt["name"], bx0 - 3, by0 - 1, bx1 + 3, by1 + 1))
+
+        # Field monitor labels in XY / XZ views: along the bottom, staggered like the port labels
+        if self.view_kind in ("xy", "xz"):
+            last_px, row_idx = -999, 0
+            for mm in self.model.field_monitors:
+                if not mm["has_data"]:
+                    continue
+                px, _ = self.uv_to_px(mm["x"], 0)
+                if not (x0 <= px <= x1):
+                    continue
+                if px - last_px < 52:
+                    row_idx = (row_idx + 1) % 3
+                else:
+                    row_idx, last_px = 0, px
+                is_sel = mm["name"] == self.selected_port
+                label = mm["name"][3:] if mm["name"].startswith(("yz_", "yz ")) else mm["name"]
+                tid = c.create_text(px, y1 - 9 - row_idx * 13, text=label, font=(FONT_MONO, 8, "bold"),
+                                    fill="#0f1115" if is_sel else T["monitor_cyan"])
+                bx0, by0, bx1, by1 = c.bbox(tid)
+                bg = c.create_rectangle(bx0 - 3, by0 - 1, bx1 + 3, by1 + 1,
+                                        fill=T["monitor_cyan_bright"] if is_sel else "#0d2a33", outline=T["monitor_cyan"])
+                c.tag_lower(bg, tid)
+                self._port_hit_boxes.append((mm["name"], bx0 - 3, by0 - 1, bx1 + 3, by1 + 1))
 
         # Clip border on top
         c.create_rectangle(x0, y0, x1, y1, fill="", outline=T["border"])
@@ -1657,6 +2056,7 @@ class ModelView3DCanvas(tk.Frame):
         self.port_faces_3d = []
         self.bbox_3d = None
         self._half = (1.0, 1.0, 1.0, 1.0)
+        self.bsp = None
 
         self.canvas.bind("<Configure>", lambda e: self.redraw())
         self.canvas.bind("<ButtonPress-1>", self._on_mouse_down)
@@ -1693,42 +2093,61 @@ class ModelView3DCanvas(tk.Frame):
 
     def set_selected_port(self, port_name):
         self.selected_port = port_name
-        self._rebuild_3d_scene()
-        self.redraw()
+        self.redraw()  # the selection only changes the colors: the scene is kept
+
+    PORT_HATCH_LINES = 7
 
     def _rebuild_3d_scene(self):
         self.faces_3d = []
         self.port_faces_3d = []
+        self.bsp = None
         if self.model is None:
             self.bbox_3d = None
             return
 
+        # Background slabs (BOX, cladding, substrate) are drawn see-through when shown: they
+        # enclose the waveguide cores, which would otherwise be hidden inside them.
         show_slabs = self.show_slabs_var.get()
         for st in self.model.structures:
             if st["is_background"] and not show_slabs:
                 continue
-            faces = extruded_poly_faces_3d(st["xy_poly"], st["zmin"], st["zmax"], st["fill"], tag=st["name"])
-            self.faces_3d.extend(faces)
+            ghost = bool(st["is_background"])
+            for verts, kind, color, _tag in extruded_poly_faces_3d(st["xy_poly"], st["zmin"], st["zmax"], st["fill"],
+                                                                   tag=st["name"]):
+                self.faces_3d.append((verts, kind, color, ghost))
 
-        # Port 3D yellow planes (slightly thickened or quad plates at port x)
-        for pt in self.model.ports:
+        # Port planes (in y-z at the port x), mode expansion monitors included
+        for pt in self.model.port_planes():
             x = pt["x"]
             y0, y1 = pt["ymin"], pt["ymax"]
             z0, z1 = pt["zmin"], pt["zmax"]
-            quad = [(x, y0, z0), (x, y1, z0), (x, y1, z1), (x, y0, z1)]
-            is_sel = pt["name"] == self.selected_port
             self.port_faces_3d.append({
                 "name": pt["name"],
+                "kind": "port",
                 "x": x,
                 "y": pt["y"],
                 "z": z1,
-                "direction": pt["direction"],
-                "is_selected": is_sel,
+                "direction": pt["direction"] or "+",
                 "enabled": pt["enabled"],
-                "verts": quad,
+                "verts": [(x, y0, z0), (x, y1, z0), (x, y1, z1), (x, y0, z1)],
+            })
+        # Field monitor planes (cyan), drawn like ports
+        for mm in self.model.field_monitors:
+            if not mm["has_data"]:
+                continue
+            x, y0, y1, z0, z1 = mm["x"], mm["ymin"], mm["ymax"], mm["zmin"], mm["zmax"]
+            self.port_faces_3d.append({
+                "name": mm["name"],
+                "kind": "monitor",
+                "x": x,
+                "y": mm["y"],
+                "z": z1,
+                "direction": "+",
+                "enabled": True,
+                "verts": [(x, y0, z0), (x, y1, z0), (x, y1, z1), (x, y0, z1)],
             })
 
-        # Compute bounding box from FDTD box + core structures + ports
+        # Bounding box from FDTD box + shown structures + ports
         xs, ys, zs = [], [], []
         if self.model.fdtd_box:
             fx0, fx1, fy0, fy1, fz0, fz1 = self.model.fdtd_box
@@ -1746,12 +2165,54 @@ class ModelView3DCanvas(tk.Frame):
                 ys.append(vy)
                 zs.append(vz)
 
-        if xs and ys and zs:
-            self.bbox_3d = (min(xs), max(xs), min(ys), max(ys), min(zs), max(zs))
-            xmin, xmax, ymin, ymax, zmin, zmax = self.bbox_3d
-            self._half = view_box_half_extents(xmax - xmin, ymax - ymin, zmax - zmin)
-        else:
+        if not (xs and ys and zs):
             self.bbox_3d = None
+            return
+        self.bbox_3d = (min(xs), max(xs), min(ys), max(ys), min(zs), max(zs))
+        xmin, xmax, ymin, ymax, zmin, zmax = self.bbox_3d
+        self._half = view_box_half_extents(xmax - xmin, ymax - ymin, zmax - zmin)
+        self._build_bsp()
+
+    def _build_bsp(self):
+        """The depth-ordering tree of the scene, in the normalized view-box coordinates
+        (the camera only rotates and zooms these, so the tree is built once per scene)."""
+        polys, segs = [], []
+        for verts, kind, color, ghost in self.faces_3d:
+            nv = [self._normalize(*v) for v in verts]
+            plane = polygon_plane(nv)
+            if plane is None:
+                continue  # zero-area face (e.g. a side face of a zero-thickness layer)
+            fill_c, edge_c = face_colors(color, kind)
+            for pv, pe in convex_pieces(nv, [True] * len(nv), plane[0]):
+                polys.append({"v": pv, "e": pe, "plane": plane, "kind": "ghost" if ghost else "solid",
+                              "fill": fill_c, "edge": edge_c, "cull": not ghost})
+
+        for pf in self.port_faces_3d:
+            nv = [self._normalize(*v) for v in pf["verts"]]
+            plane = polygon_plane(nv)
+            if plane is None:
+                continue
+            polys.append({"v": nv, "e": [True] * 4, "plane": plane, "kind": "port", "port": pf, "cull": False})
+            # Diagonal hatching: a port plane is see-through (Tk on macOS has no stippled fill)
+            (x, y0, z0), (_, y1, _), (_, _, z1) = pf["verts"][0], pf["verts"][1], pf["verts"][2]
+            n = self.PORT_HATCH_LINES
+            for k in range(1, 2 * n + 2):
+                s = k / (n + 1.0)
+                if s >= 2.0:
+                    break
+                (ua, va), (ub, vb) = ((s, 0.0), (0.0, s)) if s <= 1.0 else ((1.0, s - 1.0), (s - 1.0, 1.0))
+                a = self._normalize(x, y0 + ua * (y1 - y0), z0 + va * (z1 - z0))
+                b = self._normalize(x, y0 + ub * (y1 - y0), z0 + vb * (z1 - z0))
+                segs.append({"a": a, "b": b, "kind": "hatch", "port": pf})
+
+        xmin, xmax, ymin, ymax, zmin, zmax = self.model.fdtd_box or self.bbox_3d
+        corners = [self._normalize(*p) for p in (
+            (xmin, ymin, zmin), (xmax, ymin, zmin), (xmax, ymax, zmin), (xmin, ymax, zmin),
+            (xmin, ymin, zmax), (xmax, ymin, zmax), (xmax, ymax, zmax), (xmin, ymax, zmax))]
+        for i, j in ((0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4), (0, 4), (1, 5), (2, 6), (3, 7)):
+            segs.append({"a": corners[i], "b": corners[j], "kind": "box"})
+
+        self.bsp = build_bsp(polys, segs)
 
     def _on_mouse_down(self, event):
         self._drag_prev = (event.x, event.y)
@@ -1801,8 +2262,13 @@ class ModelView3DCanvas(tk.Frame):
         nz = (z - zmid) / (dz * 0.5) * hz
         return nx, ny, nz
 
-    def _project_point(self, x, y, z, cx, cy, scale):
-        nx, ny, nz = self._normalize(x, y, z)
+    def _eye(self):
+        """Camera position in normalized coordinates: on the depth axis, EYE_DISTANCE from the center."""
+        az, el = math.radians(self.azim), math.radians(self.elev)
+        d = self.EYE_DISTANCE
+        return d * math.cos(el) * math.sin(az), d * math.cos(el) * math.cos(az), d * math.sin(el)
+
+    def _project_normalized(self, nx, ny, nz, cx, cy, scale):
         az = math.radians(self.azim)
         el = math.radians(self.elev)
         cos_a, sin_a = math.cos(az), math.sin(az)
@@ -1816,10 +2282,48 @@ class ModelView3DCanvas(tk.Frame):
         py_3d = -ry * sin_e + rz * cos_e
         depth = ry * cos_e + rz * sin_e
 
+        # perspective seen from the eye at depth EYE_DISTANCE (= 3.2 / 0.35)
         persp = 1.0 / max(0.4, 3.2 - depth * 0.35) * 2.8
         sx = cx + self.pan_x + px_3d * scale * self.zoom * persp
         sy = cy + self.pan_y - py_3d * scale * self.zoom * persp
         return sx, sy, depth
+
+    def _project_point(self, x, y, z, cx, cy, scale):
+        return self._project_normalized(*self._normalize(x, y, z), cx, cy, scale)
+
+    @staticmethod
+    def _edge_runs(pts, flags):
+        """Polylines [x0, y0, x1, y1, ...] along the consecutive outline edges of a polygon."""
+        n = len(pts)
+        if all(flags):
+            return [[c for p in pts + pts[:1] for c in p]]
+        runs = []
+        start = next(i for i in range(n) if not flags[i - 1])  # first edge after a non-outline one
+        run = None
+        for k in range(n):
+            i = (start + k) % n
+            if flags[i]:
+                if run is None:
+                    run = list(pts[i])
+                run.extend(pts[(i + 1) % n])
+            elif run is not None:
+                runs.append(run)
+                run = None
+        if run is not None:
+            runs.append(run)
+        return runs
+
+    def _port_style(self, pf):
+        """(color, frame width, dash) of a port or field monitor plane."""
+        if pf.get("kind") == "monitor":
+            if pf["name"] == self.selected_port:
+                return THEME["monitor_cyan_bright"], 2.4, ()
+            return THEME["monitor_cyan"], 1.2, (5, 3)
+        if not pf["enabled"]:  # a disabled port takes no part in the simulation: faint
+            return "#8a7a1a", 1.2, (3, 3)
+        if pf["name"] == self.selected_port:
+            return THEME["port_yellow_bright"], 2.6, ()
+        return THEME["port_yellow"], 1.6, ()
 
     def redraw(self):
         c = self.canvas
@@ -1841,89 +2345,79 @@ class ModelView3DCanvas(tk.Frame):
             self._draw_axes_triad(w, h)
             return
 
-        # 1. Draw 3D bounding / FDTD wireframe box
-        xmin, xmax, ymin, ymax, zmin, zmax = self.model.fdtd_box or self.bbox_3d
-        box_corners = [
-            (xmin, ymin, zmin), (xmax, ymin, zmin), (xmax, ymax, zmin), (xmin, ymax, zmin),
-            (xmin, ymin, zmax), (xmax, ymin, zmax), (xmax, ymax, zmax), (xmin, ymax, zmax),
-        ]
-        proj_corners = [self._project_point(*pt, cx, cy, scale) for pt in box_corners]
-        box_edges = [
-            (0, 1), (1, 2), (2, 3), (3, 0),
-            (4, 5), (5, 6), (6, 7), (7, 4),
-            (0, 4), (1, 5), (2, 6), (3, 7),
-        ]
-        for i, j in box_edges:
-            c.create_line(
-                proj_corners[i][0], proj_corners[i][1],
-                proj_corners[j][0], proj_corners[j][1],
-                fill=THEME["fdtd_orange"] if self.model.fdtd_box else THEME["grid_axis"],
-                dash=(3, 3),
-            )
+        proj_cache = {}
 
-        # 2. Painter's algorithm depth sort of all solid faces + yellow port planes
-        render_queue = []
-        for verts, kind, base_color, _tag in self.faces_3d:
-            pts = [self._project_point(*v, cx, cy, scale) for v in verts]
-            avg_depth = sum(p[2] for p in pts) / len(pts)
-            fill_c, edge_c = face_colors(base_color, kind)
-            render_queue.append((avg_depth, "solid", pts, fill_c, edge_c, None))
+        def proj(v):
+            p = proj_cache.get(v)
+            if p is None:
+                p = proj_cache[v] = self._project_normalized(*v, cx, cy, scale)[:2]
+            return p
 
-        for pf in self.port_faces_3d:
-            pts = [self._project_point(*v, cx, cy, scale) for v in pf["verts"]]
-            avg_depth = sum(p[2] for p in pts) / len(pts) + 1e-4
-            kind = "port_selected" if pf["is_selected"] else "port"
-            fill_c, edge_c = face_colors(THEME["port_yellow"], kind)
-            render_queue.append((avg_depth, "port", pts, fill_c, edge_c, pf))
+        box_color = THEME["fdtd_orange"] if self.model.fdtd_box else THEME["grid_axis"]
 
-        render_queue.sort(key=lambda item: item[0])
-
-        for _depth, rkind, pts, fill_c, edge_c, pf in render_queue:
-            coords = [coord for pt in pts for coord in (pt[0], pt[1])]
-            if rkind == "port":
-                # Draw yellow port plane with stipple/translucent look and bright yellow border
-                c.create_polygon(
-                    *coords,
-                    fill=THEME["port_yellow_bright"] if pf["is_selected"] else THEME["port_yellow"],
-                    stipple="gray50" if pf["enabled"] else "gray12",  # a disabled port: faint
-                    outline=edge_c,
-                    width=2.4 if pf["is_selected"] else 1.6,
-                )
-                # Port label at top center of port frame
-                top_x = 0.5 * (pts[2][0] + pts[3][0])
-                top_y = 0.5 * (pts[2][1] + pts[3][1]) - 7
-                short = pf["name"].replace("output_port", "P").replace("input_port", "In")
-                if not pf["enabled"]:
-                    short += " (off)"
-                c.create_text(
-                    top_x,
-                    top_y,
-                    text=short,
-                    font=(FONT_MONO, 8, "bold"),
-                    fill=THEME["port_yellow_bright"] if pf["is_selected"] else THEME["port_yellow"],
-                )
+        # Painter's algorithm in the exact back-to-front order of the BSP tree
+        for kind, item in bsp_back_to_front(self.bsp, self._eye()):
+            if kind == "seg":
+                (xa, ya), (xb, yb) = proj(item["a"]), proj(item["b"])
+                if item["kind"] == "box":
+                    c.create_line(xa, ya, xb, yb, fill=box_color, dash=(3, 3))
+                else:  # port hatching
+                    color, _w, dash = self._port_style(item["port"])
+                    c.create_line(xa, ya, xb, yb, fill=color, width=1, dash=dash)
+                continue
+            pts = [proj(v) for v in item["v"]]
+            if item["kind"] == "solid":
+                # outline in the fill color closes the hairline seams between split fragments
+                c.create_polygon(*[q for p in pts for q in p], fill=item["fill"], outline=item["fill"], width=1)
+                edge_c, width, dash = item["edge"], 1.0, ()
+            elif item["kind"] == "ghost":
+                edge_c, width, dash = item["edge"], 1.0, (2, 3)
             else:
-                c.create_polygon(*coords, fill=fill_c, outline=edge_c, width=1.0)
+                edge_c, width, dash = self._port_style(item["port"])
+            for run in self._edge_runs(pts, item["e"]):
+                c.create_line(*run, fill=edge_c, width=width, dash=dash)
+
+        # Port labels on top of everything, above the top edge of the port plane
+        # (of the field monitors only the selected one is labelled: they are many)
+        for pf in self.port_faces_3d:
+            if pf.get("kind") == "monitor" and pf["name"] != self.selected_port:
+                continue
+            (_, y0, _), (_, y1, z1) = pf["verts"][0], pf["verts"][2]
+            top_x, top_y, _ = self._project_point(pf["x"], 0.5 * (y0 + y1), z1, cx, cy, scale)
+            color, _w, _d = self._port_style(pf)
+            short = pf["name"].replace("output_port", "P").replace("input_port", "In")
+            if not pf["enabled"]:
+                short += " (off)"
+            self._badge(top_x, top_y - 8, short, color, font=(FONT_MONO, 8, "bold"))
 
         # Dimension badges
-        p_x0, p_x1, p_y1, p_z1 = proj_corners[0], proj_corners[1], proj_corners[2], proj_corners[5]
+        xmin, xmax, ymin, ymax, zmin, zmax = self.model.fdtd_box or self.bbox_3d
+        p_x0 = self._project_point(xmin, ymin, zmin, cx, cy, scale)
+        p_x1 = self._project_point(xmax, ymin, zmin, cx, cy, scale)
+        p_y1 = self._project_point(xmax, ymax, zmin, cx, cy, scale)
+        p_z1 = self._project_point(xmax, ymin, zmax, cx, cy, scale)
         self._badge(0.5 * (p_x0[0] + p_x1[0]), 0.5 * (p_x0[1] + p_x1[1]) + 14, f"Δx={xmax - xmin:g} μm", "#74c0fc")
         self._badge(0.5 * (p_x1[0] + p_y1[0]) + 24, 0.5 * (p_x1[1] + p_y1[1]) + 8, f"Δy={ymax - ymin:g} μm", "#63e6be")
         self._badge(0.5 * (p_x1[0] + p_z1[0]) + 30, 0.5 * (p_x1[1] + p_z1[1]), f"Δz={zmax - zmin:g} μm", "#ffa8a8")
 
         # Legend pill in top-left corner
-        c.create_text(
+        tid = c.create_text(
             14, 12,
-            text=f"■ Ports ({len(self.model.ports)}) in Yellow   ■ FDTD Box",
+            text=f"■ Ports ({len(self.port_faces_3d) - sum(pf.get('kind') == 'monitor' for pf in self.port_faces_3d)})"
+                 f" in Yellow   ■ FDTD Box",
             font=(FONT_UI, 9, "bold"),
             fill=THEME["port_yellow"],
             anchor="nw",
         )
+        n_mon = sum(pf.get("kind") == "monitor" for pf in self.port_faces_3d)
+        if n_mon:
+            c.create_text(c.bbox(tid)[2] + 12, 12, text=f"■ Field monitors ({n_mon})", font=(FONT_UI, 9, "bold"),
+                          fill=THEME["monitor_cyan"], anchor="nw")
 
         self._draw_axes_triad(w, h)
 
-    def _badge(self, x, y, text, color):
-        tid = self.canvas.create_text(x, y, text=text, font=(FONT_UI, 8, "bold"), fill=color)
+    def _badge(self, x, y, text, color, font=(FONT_UI, 8, "bold")):
+        tid = self.canvas.create_text(x, y, text=text, font=font, fill=color)
         bx0, by0, bx1, by1 = self.canvas.bbox(tid)
         bg = self.canvas.create_rectangle(bx0 - 4, by0 - 1, bx1 + 4, by1 + 1, fill=THEME["app_bg"], outline="")
         self.canvas.tag_lower(bg, tid)
@@ -2141,9 +2635,9 @@ class ParameterEditorPanel(tk.Frame):
         elif self.mode == "props":
             for ob in f.objects:
                 lines.append(f"== {ob.name}  (uuid {ob.uuid}, offset 0x{ob.offset:x}, tag {ob.tag})")
-                for k, v in ob.props.items():
+                for k, v in ob.props.raw_items():
                     lines.append(f"   {k:45s} = {_fmt(v)}")
-                for k, v in ob.results.items():
+                for k, v in ob.results.raw_items():
                     lines.append(f"   [result] {k:36s} = {_fmt(v)}")
                 lines.append("")
         elif self.mode == "materials":
@@ -2160,7 +2654,7 @@ class ParameterEditorPanel(tk.Frame):
                 except Exception:
                     pass
                 lines.append(f"== {mname}  (type {mtype}){idx_str}")
-                for k, v in m.items():
+                for k, v in m.raw_items():
                     if k != "name":
                         lines.append(f"   {k:35s} = {_fmt(v)}")
                 lines.append("")
@@ -2863,7 +3357,8 @@ class FSPGuiApp:
         "Cross-Sections & Port Modes (n & |E|²)",
         "Stored Port Mode |E|² Profile (YZ)",
         "Stored Refractive Index n(y, z) (YZ)",
-        "Simulated Port Field |E|² (YZ, .h5)",
+        "Simulated Field |E|² in YZ Planes (ports & monitors)",
+        "Power Through YZ Planes vs x & λ (ports & monitors)",
         "Power & Mode Coupling vs. Port x (.h5)",
         "Port Transmission vs. Wavelength λ (.h5)",
         "XZ Propagation |E|² at y=0 (dB, .h5)",
@@ -3244,6 +3739,9 @@ class FSPGuiApp:
         port_choices = ["All Ports"] + [pt["name"] for pt in self.model.ports]
         for mm in self.model.mode_monitors:
             port_choices.append(mm["name"])
+        for mm in self.model.field_monitors:  # y-z planes with a recorded field
+            if mm["has_data"]:
+                port_choices.append(mm["name"])
         self.cmb_port["values"] = port_choices
         default_port = self.model.ports[0]["name"] if self.model.ports else "All Ports"
         self.port_var.set("All Ports" if len(self.model.ports) > 1 else default_port)
@@ -3272,6 +3770,11 @@ class FSPGuiApp:
 
     def _on_port_dropdown_changed(self, _event=None):
         sel_port = self.port_var.get()
+        # a field monitor has no stored mode: show its recorded field instead
+        if self.model is not None and any(mm["name"] == sel_port for mm in self.model.field_monitors) \
+                and self.result_var.get() not in ("Simulated Field |E|² in YZ Planes (ports & monitors)", "Power Through YZ Planes vs x & λ (ports & monitors)",
+                                                  "Top-View Layout & Taper Zoom (XY)"):
+            self.result_var.set("Simulated Field |E|² in YZ Planes (ports & monitors)")
         self.view_xy.set_selected_port(sel_port)
         self.view_xz.set_selected_port(sel_port)
         self.view_yz.set_selected_port(sel_port)
@@ -3382,11 +3885,12 @@ class FSPGuiApp:
     def _get_target_ports(self, max_all=4):
         """Returns list of port/monitor names to plot based on the Port dropdown."""
         sel = self.port_var.get()
-        all_names = [pt["name"] for pt in self.model.ports if pt.get("mode_exp_obj") is not None]
-        if len(all_names) < 2 and self.model.mode_monitors:
-            for mm in self.model.mode_monitors:
-                if mm["name"] not in all_names:
-                    all_names.append(mm["name"])
+        # enabled ports with a stored mode, and the enabled mode expansion monitors, along x
+        planes = [pt for pt in self.model.ports if pt.get("mode_exp_obj") is not None and pt["enabled"]]
+        planes += [mm for mm in self.model.mode_monitors if mm["enabled"] and mm["placed"]]
+        all_names = [pl["name"] for pl in sorted(planes, key=lambda pl: pl["x"])]
+        if not all_names:
+            all_names = [pt["name"] for pt in self.model.ports if pt.get("mode_exp_obj") is not None]
         if not all_names:
             all_names = [pt["name"] for pt in self.model.ports]
         if sel == "All Ports" or not sel:
@@ -3395,6 +3899,9 @@ class FSPGuiApp:
                 idxs = np.linspace(0, len(all_names) - 1, max_all, dtype=int)
                 return [all_names[i] for i in idxs]
             return all_names
+        if any(mm["name"] == sel for mm in self.model.field_monitors):
+            raise RuntimeError(f"'{sel}' is a field monitor: it holds the simulated field, not a stored mode.\n"
+                               "Choose a port, or the result 'Simulated Field |E|² in YZ Planes'.")
         return [sel]
 
     def _render_onto_figure(self, fig: Figure):
@@ -3411,8 +3918,10 @@ class FSPGuiApp:
                 self._plot_stored_single_quantity(fig, port_sel, quantity="E2")
             elif res_kind == "Stored Refractive Index n(y, z) (YZ)":
                 self._plot_stored_single_quantity(fig, port_sel, quantity="n")
-            elif res_kind == "Simulated Port Field |E|² (YZ, .h5)":
+            elif res_kind == "Simulated Field |E|² in YZ Planes (ports & monitors)":
                 self._plot_simulated_port_fields(fig, port_sel, k_freq, lam)
+            elif res_kind == "Power Through YZ Planes vs x & λ (ports & monitors)":
+                self._plot_plane_power(fig, port_sel, k_freq, lam)
             elif res_kind == "Power & Mode Coupling vs. Port x (.h5)":
                 self._plot_power_and_mode_coupling(fig, port_sel)
             elif res_kind == "Port Transmission vs. Wavelength λ (.h5)":
@@ -3559,57 +4068,67 @@ class FSPGuiApp:
             self._store_grid_export(f"Stored {quantity} for {pname}", y, z, [(quantity, mat)])
 
     def _plot_simulated_port_fields(self, fig: Figure, port_sel: str, k_freq: int, lam: np.ndarray):
-        if self.model.h5 is None:
-            raise RuntimeError("Companion .h5 file is required to plot simulated DFT port fields.")
+        """|E|² recorded in the y-z planes of the ports and field monitors, from the .h5 file or
+        from the .fsp itself (read one frequency at a time)."""
+        planes = self.model.field_planes()
+        if not planes:
+            raise RuntimeError("No recorded field in any port or monitor plane: the project holds no "
+                               "results, and no matching .h5 file is open.")
+        if port_sel in planes:
+            show = [port_sel]
+        elif port_sel and port_sel != "All Ports":
+            raise RuntimeError(f"'{port_sel}' has no recorded field. Planes with fields: {', '.join(planes)}")
+        elif len(planes) > 8:
+            show = [planes[i] for i in np.linspace(0, len(planes) - 1, 8).astype(int)]
+        else:
+            show = planes
 
-        ports = self.model.ports if port_sel == "All Ports" else [
-            pt for pt in self.model.ports if pt["name"] == port_sel
-        ]
-        if not ports:
-            ports = self.model.ports
-
-        ncols = len(ports)
-        axs = fig.subplots(1, ncols, squeeze=False)
+        ncols = min(4, len(show))
+        nrows = -(-len(show) // ncols)
+        axs = fig.subplots(nrows, ncols, squeeze=False)
         self._style_mpl_axes(axs)
+        for ax in axs.ravel()[len(show):]:
+            ax.set_visible(False)
 
         im = None
         first_export = None
-        for j, pt in enumerate(ports):
-            ax = axs[0, j]
-            m = pt["h5_group"]
-            y = self.model.h5[m]["y"][()]
-            z = self.model.h5[m]["z"][()]
-            E2 = sum(np.abs(self.model.h5_field(m, c, k_freq)[:, :, 0]) ** 2 for c in ("Ex", "Ey", "Ez"))
-            if y[0] >= -1e-6 and len(y) > 1:
+        port_names = {pt["name"] for pt in self.model.ports}
+        for j, name in enumerate(show):
+            ax = axs.ravel()[j]
+            x, y, z = self.model.plane_grid(name)
+            E2 = sum(np.abs(self.model.plane_field(name, c, k_freq)) ** 2
+                     for c in ("Ex", "Ey", "Ez") if self.model.plane_has(name, c))
+            if y[0] >= -1e-6 and len(y) > 1:  # symmetric simulation: only y >= 0 recorded
                 yy = np.concatenate([-y[:0:-1], y])
                 E2f = np.concatenate([E2[:, :0:-1], E2], axis=1)
             else:
                 yy, E2f = y, E2
-            E2_norm = E2f / max(float(E2f.max()), 1e-30)
+            E2_norm = E2f / max(float(E2f.max()), 1e-300)
             im = ax.pcolormesh(yy, z, E2_norm, shading="auto", cmap="inferno", vmin=0.0, vmax=1.0)
-            try:
-                ys, zs, M, _, _ = self.model.stored_mode(pt["name"])
-                ax.contour(ys, zs, M["n"], levels=[1.2, 1.445, 1.7], colors="w", linewidths=0.5)
-            except Exception:
-                pass
+            if name in port_names:
+                try:
+                    ys, zs, M, _, _ = self.model.stored_mode(name)
+                    ax.contour(ys, zs, M["n"], levels=[1.2, 1.445, 1.7], colors="w", linewidths=0.5)
+                except Exception:
+                    pass
             ax.set_xlim(yy[0], yy[-1])
             ax.set_ylim(z[0], z[-1])
             ax.set_aspect("equal")
-            x_h5 = float(self.model.h5[m]["x"][0])
-            ax.set_title(f"{pt['name'].replace('output_', '')}\nx = {x_h5:.2f} μm", fontsize=9)
+            color = THEME["port_yellow"] if name in port_names else THEME["monitor_cyan"]
+            ax.set_title(f"{name.replace('output_', '')}\nx = {x:.2f} μm", fontsize=9, color=color)
             ax.set_xlabel("y (μm)")
-            if j == 0:
+            if j % ncols == 0:
                 ax.set_ylabel("z (μm)")
             if first_export is None:
-                first_export = (pt["name"], yy, z, E2_norm)
+                first_export = (name, yy, z, E2_norm)
 
         if im is not None:
-            cb = fig.colorbar(im, ax=axs[0, :].tolist(), shrink=0.8)
+            cb = fig.colorbar(im, ax=axs.ravel()[:len(show)].tolist(), shrink=0.8)
             cb.set_label("|E|² (norm.)", color=THEME["text"])
             cb.ax.yaxis.set_tick_params(color=THEME["text_muted"], labelcolor=THEME["text_muted"])
 
         fig.suptitle(
-            f"Simulated |E|² in port plane (normalised), λ = {lam[k_freq]:.1f} nm (white = index contours)",
+            f"Simulated |E|² (each plane normalised), λ = {lam[k_freq]:.1f} nm",
             color=THEME["text"],
             fontsize=10.5,
             fontweight="bold",
@@ -3618,11 +4137,71 @@ class FSPGuiApp:
         if first_export:
             pname, yy, z, mat = first_export
             self._store_grid_export(
-                f"Simulated Port |E|^2 ({pname}, lambda={lam[k_freq]:.1f} nm)",
+                f"Simulated |E|^2 ({pname}, lambda={lam[k_freq]:.1f} nm)",
                 yy,
                 z,
                 [("E2_norm", mat)],
             )
+
+    def _plot_plane_power(self, fig: Figure, port_sel: str, k_freq: int, lam: np.ndarray):
+        """Power through the port and field monitor planes along x, relative to the first plane:
+        at the chosen wavelength, and (when the planes store their power spectrum) against λ."""
+        planes = []
+        for name in self.model.field_planes():
+            pw = self.model.plane_power(name, k_freq)
+            if pw is not None:
+                x, _, _ = self.model.plane_grid(name)
+                planes.append((name, x, pw))
+        if not planes:
+            raise RuntimeError("No port or monitor plane holds a power result or the E and H fields "
+                               "needed to compute it.")
+        ref_name, _, ref = planes[0]
+        if not ref:
+            raise RuntimeError(f"The first plane ({ref_name}) carries no power.")
+        port_names = {pt["name"] for pt in self.model.ports}
+        spectra = {name: self.model.plane_power_spectrum(name) for name, _, _ in planes}
+        has_spectra = all(v is not None for v in spectra.values())
+
+        axs = fig.subplots(1, 2 if has_spectra else 1, squeeze=False)[0]
+        self._style_mpl_axes(list(axs))
+        a1 = axs[0]
+        xs = [x for _, x, _ in planes]
+        rel = [pw / ref for _, _, pw in planes]
+        a1.plot(xs, rel, "-", color=THEME["text_muted"], lw=1.2)
+        for i, ((name, x, _), r) in enumerate(zip(planes, rel)):
+            is_port = name in port_names
+            a1.plot([x], [r], "s" if is_port else "o", ms=8 if name == port_sel else 6,
+                    color=THEME["port_yellow"] if is_port else THEME["monitor_cyan"],
+                    markeredgecolor="#ffffff" if name == port_sel else "none")
+            a1.annotate(name, (x, r), textcoords="offset points", xytext=(0, 9 if i % 2 == 0 else -16),
+                        ha="center", fontsize=7.5, color=THEME["text_muted"])
+        a1.set_xlabel("x (μm)")
+        a1.set_ylabel(f"P / P({ref_name})")
+        a1.set_title(f"Power through the planes along x, λ = {lam[k_freq]:.1f} nm", fontsize=10)
+        a1.grid(alpha=0.25, color=THEME["grid_axis"])
+        a1.set_ylim(bottom=0, top=max(1.1, max(rel) * 1.15))
+
+        rows = ["plane\tx_um\tP_over_P_first"] + [f"{n}\t{x:.4f}\t{r:.6g}" for (n, x, _), r in zip(planes, rel)]
+        if has_spectra:
+            a2 = axs[1]
+            _, lam_all, _ = self.model.get_frequencies_and_wavelengths()
+            order = np.argsort(lam_all)
+            ref_spec = spectra[ref_name]
+            cmap = matplotlib.colormaps["viridis"]
+            for i, (name, x, _) in enumerate(planes[1:], start=1):
+                t = spectra[name] / np.where(ref_spec == 0, np.nan, ref_spec)
+                a2.plot(lam_all[order], t[order], lw=1.4, color=cmap(i / max(1, len(planes) - 1)),
+                        label=f"{name} (x={x:.4g} μm)")
+            a2.axvline(lam[k_freq], color=THEME["text_dim"], ls=":", lw=1)
+            a2.set_xlabel("Wavelength λ (nm)")
+            a2.set_ylabel(f"P / P({ref_name})")
+            a2.set_title("Power spectrum through each plane", fontsize=10)
+            a2.grid(alpha=0.25, color=THEME["grid_axis"])
+            a2.legend(fontsize=7.5, facecolor="#1a1e25", edgecolor=THEME["border"], labelcolor=THEME["text"],
+                      loc="best", framealpha=0.85)
+        fig.set_layout_engine("constrained")
+        self.last_exported_tsv = "\n".join(rows)
+        self.last_exported_desc = f"Power through {len(planes)} planes, lambda={lam[k_freq]:.1f} nm"
 
     def _plot_power_and_mode_coupling(self, fig: Figure, port_sel: str):
         xs, freqs, lam, P, Prel, eta, Tmode = self.model.compute_power_and_mode_coupling()
@@ -3763,10 +4342,9 @@ class FSPGuiApp:
 
         xs_all = [v for st in self.model.structures for v in (st["xmin"], st["xmax"])] or [-35, 225]
         ys_all = [v for st in self.model.structures for v in (st["ymin"], st["ymax"])] or [-25, 25]
-        core_ys = [v for st in self.model.structures if st["is_core"] for v in (st["ymin"], st["ymax"])] or [-0.6, 0.6]
-        core_lim = max(0.6, max(abs(v) for v in core_ys) * 1.6)
+        core_lo, core_hi = core_y_window(self.model.structures)
 
-        for ax, ylim in ((a1, (min(ys_all) * 1.05, max(ys_all) * 1.05)), (a2, (-core_lim, core_lim))):
+        for ax, ylim in ((a1, (min(ys_all) * 1.05, max(ys_all) * 1.05)), (a2, (core_lo, core_hi))):
             for st in self.model.structures:
                 if st["is_background"] and not st["gds_layer"]:
                     continue
@@ -3809,7 +4387,7 @@ class FSPGuiApp:
         for pt in self.model.ports:
             a2.text(
                 pt["x"],
-                core_lim * 0.88,
+                core_hi - 0.06 * (core_hi - core_lo),
                 pt["name"].replace("output_", "").replace("_port", ""),
                 rotation=90,
                 fontsize=7.5,
