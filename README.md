@@ -2,7 +2,7 @@
 
 <img src="icon.png" width="96" alt="FSP Viewer icon: a black square on a yellow background">
 
-**Version 0.2.1** — see [Version History](#version-history).
+**Version 0.2.2** — see [Version History](#version-history).
 
 View Ansys Lumerical FDTD project files (`.fsp`), plot their results and save their geometry as GDS **without a Lumerical license**, on macOS and Linux, and on Windows as a ready-to-run program that needs no Python (see [Windows application](#windows-application)).
 
@@ -116,8 +116,8 @@ The plot is drawn in the large panel on the right, with the matplotlib toolbar (
 | Stored Refractive Index n(y, z) (YZ) | | The index cross-section at the port |
 | Simulated Field \|E\|² in YZ Planes | ✓ or in `.fsp` | The simulated field in the port and field-monitor planes at the chosen wavelength |
 | Power Through YZ Planes vs x & λ | ✓ or in `.fsp` | Power through the port and monitor planes along the device, relative to the first one, and its spectrum |
-| Power Spectrum at Selected Plane | ✓ or in `.fsp` | P / P_source of the selected port or monitor (all of them with *All Ports*) against λ, linear and dB; dashed: the part in the stored mode of that plane (a port's own mode, or a mode expansion monitor at the same x) |
-| S-Parameters from Power | ✓ or in `.fsp` | \|S_i1\|² = P_i / P_source of every plane, the mode-resolved \|S_i1\|², and \|S11\|² ≈ 1 − P(first plane after the source) / P_source; magnitudes only (phases are not in the powers) |
+| Power Spectrum at Selected Plane | ✓ or in `.fsp` | P / P_source of the selected port or monitor (all of them with *All Ports*) against λ, linear and dB (fields from an `.h5` file: P / P(first plane at the source), see below); dashed: the part in the stored mode of that plane (a port's own mode, or a mode expansion monitor at the same x) |
+| S-Parameters from Power | ✓ or in `.fsp` | \|S_i1\|² = P_i / P_source of every plane, the mode-resolved \|S_i1\|², and \|S11\|² ≈ 1 − P(first plane after the source) / P_source (not for fields from an `.h5` file); magnitudes only (phases are not in the powers) |
 | Power & Mode Coupling vs. Port x | ✓ | Power through each port and its overlap with the port mode |
 | Port Transmission vs. Wavelength λ | ✓ | Transmission spectrum of the ports |
 | XZ Propagation \|E\|² at y=0 (dB) | ✓ | The field along the device |
@@ -154,7 +154,7 @@ The parameters at the top of `fsp_gui.py`:
 | Parameter | Default | Meaning |
 | :--- | :--- | :--- |
 | `APP_NAME` | `"FSP Viewer"` | Window title and name of the installed application |
-| `APP_VERSION` | `"0.2.1"` | Version number; decides whether a copy on GitHub is newer |
+| `APP_VERSION` | `"0.2.2"` | Version number; decides whether a copy on GitHub is newer |
 | `APP_ICON_YELLOW`, `APP_ICON_BLACK` | `"#ffd700"`, `"#000000"` | Colours of the icon |
 | `APP_ICON_SQUARE` | `0.5` | Side of the black square, as a fraction of the yellow field |
 | `APP_ICON_MARGIN` | `0.1` | Transparent margin on each side, as a fraction of the icon size |
@@ -181,7 +181,7 @@ On Windows FSP Viewer also runs **without Python and without installing anything
 - The program looks for a new version once a week; it cannot replace itself, so it offers the download page of the new release. Unpack the new `.zip` and delete the old folder.
 - Messages and error reports go to `%USERPROFILE%\.fsp_viewer.log` (the program has no console window); settings to `%USERPROFILE%\.fsp_viewer.json`.
 
-**How it is built.** The GitHub Actions workflow `.github/workflows/windows.yml` runs `build_windows.py` on a Windows machine of GitHub whenever a version tag is pushed (`git tag v0.2.1 && git push origin v0.2.1`; the tag must match `APP_VERSION`), and attaches the `.zip` to that release; started by hand (*Actions > Windows build > Run workflow*) it only keeps the `.zip` as a download of the run. `build_windows.py` packs the program with PyInstaller, gives the `.exe` its icon and version information, starts the packed program in a self-test (every library present, the window opens) and makes the `.zip`. To build on a Windows PC yourself:
+**How it is built.** The GitHub Actions workflow `.github/workflows/windows.yml` runs `build_windows.py` on a Windows machine of GitHub whenever a version tag is pushed (`git tag v0.2.2 && git push origin v0.2.2`; the tag must match `APP_VERSION`), and attaches the `.zip` to that release; started by hand (*Actions > Windows build > Run workflow*) it only keeps the `.zip` as a download of the run. `build_windows.py` packs the program with PyInstaller, gives the `.exe` its icon and version information, starts the packed program in a self-test (every library present, the window opens) and makes the `.zip`. To build on a Windows PC yourself:
 
 ```bat
 python -m pip install -r requirements-windows.txt
@@ -229,7 +229,7 @@ print(f.material_index("SSC PH18 TS-PE-SiN"))   # n of a constant-index material
 ## Where the data is
 
 - **`.fsp`** holds the full model: object properties, the material database, GDS polygons, mesh, and port mode profiles (E, H and index). For DFT monitors it stores only coordinates and frequencies, **not** the field data.
-- **`.h5`** holds the monitor fields. Each `MonitorN` group has `x`, `y`, `z` in µm and float32 arrays `Ex … Hz` shaped `(z, y, x, 2·n_freq)`, with the last axis ordered `[Re f1, Im f1, Re f2, Im f2, …]`. Monitor names and frequencies are not in the `.h5`; take them from the `.fsp`.
+- **`.h5`** holds the monitor fields. Each `MonitorN` group has `x`, `y`, `z` in µm and float32 arrays `Ex … Hz` shaped `(z, y, x, 2·n_freq)`, with the last axis ordered `[Re f1, Im f1, Re f2, Im f2, …]`. Monitor names and frequencies are not in the `.h5`; take them from the `.fsp`. The fields have no absolute power scale that matches the source power `P0` of the `.fsp`, so powers from them are given relative to the first plane at the source. Every frequency of a component is compressed together: the viewer reads a component whole, once, and keeps it (up to 512 MB in all).
 
 ## File format (reverse-engineered)
 
@@ -257,6 +257,12 @@ Nodes tagged `1000` (structures and layer-builder internals) start with a partly
 ---
 
 ## Version History
+
+### 0.2.2 — 2026-11-18
+- **Freeze with `.h5` field files fixed** (e.g. a burst-mode run, `model/model_output.h5`): every frequency of a field component is compressed together, so reading one frequency unpacked the whole component. A spectrum took minutes, and closing the frozen window ended in *Fatal Python error: PyEval_RestoreThread*. Now a component is read once and kept, and the power spectrum and S-parameters take about 0.5 s per plane.
+- **Power from `.h5` fields** is given relative to the first plane at the source (the `.h5` fields have another scale than the source power; the result was ~10⁴³). For the IMEC taper it agrees with the absolute values of the `.fsp` results within 0.3 % across the band.
+- **Source power** now follows the spectrum of the source pulse: the plane at the source shows P / P_source ≈ 1 over the whole band instead of 0.93 at the band edges.
+- An `.h5` group is only used for a port or monitor at the same x (a disabled port took the field of `yz_input`); *XZ Propagation* uses only an x-z plane; the older `.h5` plots skip ports that recorded nothing; *Power & Mode Coupling* shows at most 7 wavelengths; a port without a stored mode says so instead of `'yMatrix'`.
 
 ### 0.2.1 — 2026-11-18
 - **Windows application** without Python: `build_windows.py` (PyInstaller) and the GitHub Actions workflow `.github/workflows/windows.yml`, which attaches `FSP-Viewer-<version>-windows.zip` to each release. The packed program is self-tested during the build (`--self-test`).

@@ -33,6 +33,7 @@ Usage:
 """
 
 import ast
+import collections
 import gc
 import json
 import math
@@ -82,7 +83,7 @@ os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 # Application parameters - edit these to customise the app
 # ======================================================================
 APP_NAME = "FSP Viewer"         # Window title, name of the installed application and (macOS) menu-bar name
-APP_VERSION = "0.2.1"           # See the version history in README.md
+APP_VERSION = "0.2.2"           # See the version history in README.md
 APP_DESCRIPTION = "Lumerical FSP 3D Viewer & Results Analyzer"
 APP_SLUG = "fsp_viewer"         # Folder and file names of the installation
 APP_CLASS = "Fsp_viewer"        # Window class (Linux: connects the windows to the menu entry)
@@ -666,6 +667,8 @@ class FSPModelData:
         self.h5_path = os.path.abspath(h5_path)
         self.h5 = h5py.File(self.h5_path, "r")
         self._power_cache = None
+        for cache in ("_h5_cache", "_h5_group_x", "_power_spectra", "_mode_spectra", "_power_ref"):  # results of the previous file
+            self.__dict__.pop(cache, None)
 
     def _extract_fdtd_box(self):
         try:
@@ -841,13 +844,28 @@ class FSPModelData:
             if pl["name"] != name:
                 continue
             grp = pl.get("h5_group")
-            if self.h5 is not None and grp and grp in self.h5:
+            if self.h5 is not None and grp and grp in self.h5 and self._h5_group_at(grp, pl.get("x")):
                 return "h5", grp
             ob = pl.get("dft_obj") if "dft_obj" in pl else pl.get("obj")
             if ob is not None and "Ex" in ob.results:
                 return "fsp", ob
             return None
         return None
+
+    def _h5_group_at(self, grp, x_um, tol=0.5):
+        """Whether the .h5 group lies at x (um): a group named only by its order (Monitor<n>) can
+        belong to another plane, e.g. when a disabled port recorded nothing."""
+        cache = self.__dict__.setdefault("_h5_group_x", {})
+        if grp not in cache:
+            try:
+                g = self.h5[grp]
+                x = float(np.ravel(g["x"][()])[0])
+                big = max(float(np.max(np.abs(g[c][()]))) for c in "yz" if c in g) if any(c in g for c in "yz") else 1.0
+                cache[grp] = x * 1e6 if big < 1e-2 else x  # metres or um
+            except Exception:
+                cache[grp] = None
+        gx = cache[grp]
+        return gx is None or x_um is None or abs(gx - x_um) <= tol
 
     def field_planes(self):
         """Names of the ports and field monitors with a recorded field, ordered along x."""
@@ -938,8 +956,64 @@ class FSPModelData:
             else:
                 order = np.argsort(fv)
                 self._source_power = np.interp(freqs, fv[order], p0[order])
+            shape = self._pulse_shape(r, freqs)
+            if shape is not None:
+                self._source_power = self._source_power * shape
             break
         return self._source_power
+
+    @staticmethod
+    def _pulse_shape(r, freqs):
+        """|s(f)|^2 / |s(f_c)|^2 of the source pulse (its stored time signal), or None.
+        The stored monitor powers are not normalised to the source spectrum, but P0 is the same
+        at every frequency: the power injected at f is P0 scaled by the pulse spectrum. (Without
+        this, the plane right at the source shows 7 % less power at the band edges than at the
+        centre, which is just the pulse spectrum.)"""
+        try:
+            t = np.ravel(r["time"]).real
+            sig = np.ravel(r["time_signal"])
+            fc = float(np.ravel(r["f"]).real[0])
+        except Exception:
+            return None
+        if t.size < 8 or t.size != sig.size or not np.all(np.isfinite(sig)) or not fc:
+            return None
+        dt = np.gradient(t)
+
+        def spec(f):
+            return np.abs(np.exp(2j * np.pi * np.outer(np.atleast_1d(f), t)) @ (sig * dt)) ** 2
+
+        s_c = spec(fc)[0]
+        if not s_c:
+            return None
+        shape = spec(np.asarray(freqs, float)) / s_c
+        # a pulse that does not cover the band (or a signal saved too coarsely) is not used
+        return shape if np.all(np.isfinite(shape)) and shape.min() > 0.05 and shape.max() < 1.5 else None
+
+    def power_reference(self):
+        """(spectrum, label, absolute) the plane powers are divided by: the source power, or, when
+        the recorded fields are on another scale than the source power (the fields of an .h5 field
+        file carry no absolute normalisation), the power through the first plane at or after the
+        source. None if neither is there."""
+        if getattr(self, "_power_ref", False) is not False:
+            return self._power_ref
+        self._power_ref = None
+        planes = self.field_planes()
+        src = next((pt for pt in self.ports if pt.get("is_source") and pt["enabled"]), None)
+        x_src = src["x"] if src else None
+        first = next((n for n in planes if x_src is None or self.plane_grid(n)[0] >= x_src - 0.01), None)
+        p_first = self.plane_power_spectrum(first) if first else None
+        ps = self.source_power()
+        if ps is not None:
+            ratio = None
+            if p_first is not None:
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    ratio = np.nanmedian(np.abs(p_first / ps))
+            if ratio is None or 1e-3 < ratio < 1e3:  # same scale: transmission = P / P_source
+                self._power_ref = (ps, "P_source", True)
+                return self._power_ref
+        if p_first is not None and np.any(p_first):
+            self._power_ref = (p_first, f"P({first})", False)
+        return self._power_ref
 
     def plane_power_spectrum(self, name):
         """Power through a plane at every frequency of the model: the stored 'power' result, else
@@ -965,11 +1039,12 @@ class FSPModelData:
         return out
 
     def plane_transmission(self, name):
-        """P / P_source of a plane at every frequency (|S_i1|^2 when all of it is in one mode), or None."""
-        pw, ps = self.plane_power_spectrum(name), self.source_power()
-        if pw is None or ps is None:
+        """P / P_source of a plane at every frequency (|S_i1|^2 when all of it is in one mode), or
+        P / P(first plane) when the fields have no absolute scale (see power_reference); or None."""
+        pw, ref = self.plane_power_spectrum(name), self.power_reference()
+        if pw is None or ref is None:
             return None
-        return pw / np.where(ps == 0, np.nan, ps)
+        return pw / np.where(ref[0] == 0, np.nan, ref[0])
 
     def plane_mode(self, name, tol=0.05):
         """(name, y, z, M, neff) of the stored mode belonging to a plane: the port's own mode, or that
@@ -1313,6 +1388,9 @@ class FSPModelData:
             target_ob = self.fsp.get(f"::{port_or_mon_name} Mode Expansion Monitor")
 
         p = target_ob.props
+        if "yMatrix" not in p or "freqEHnx0" not in p:
+            raise RuntimeError(f"'{port_or_mon_name}' has no stored mode: its mode was not calculated or not saved "
+                               "in this project (a project saved before running, or a disabled port / monitor).")
         y = p["yMatrix"].ravel() * 1e6
         z = p["zMatrix"].ravel() * 1e6
 
@@ -1337,12 +1415,34 @@ class FSPModelData:
         mode_lam_nm = (C0 / mode_freq * 1e9) if mode_freq else None
         return y, z, M, neff, mode_lam_nm
 
+    H5_WHOLE_BYTES = 512 << 20   # a field component up to this size is read whole, once
+    H5_CACHE_BYTES = 512 << 20   # field components kept in memory (least recently used dropped)
+
     def h5_field(self, mon_group, comp, k):
-        """Reads complex field component `comp` at frequency index `k` from H5 group `mon_group`."""
+        """Reads complex field component `comp` at frequency index `k` from H5 group `mon_group`.
+        Lumerical stores real and imaginary parts side by side in the last axis, and compresses
+        blocks that hold every frequency: reading one frequency unpacks the whole component.
+        So a component is read whole once and kept (spectra then need no further reading);
+        only one too large for that is read frequency by frequency."""
         if self.h5 is None or mon_group not in self.h5:
             raise KeyError(f"HDF5 group '{mon_group}' not available (open the matching .h5 file).")
         a = self.h5[mon_group][comp]
-        return a[..., 2 * k] + 1j * a[..., 2 * k + 1]
+        if a.size * a.dtype.itemsize > self.H5_WHOLE_BYTES or a.shape[-1] % 2:
+            pair = a[..., 2 * k:2 * k + 2]
+            return pair[..., 0] + 1j * pair[..., 1]
+        cache = self.__dict__.setdefault("_h5_cache", collections.OrderedDict())
+        key = (self.h5_path, mon_group, comp)
+        arr = cache.get(key)
+        if arr is None:
+            data = np.ascontiguousarray(a[()])
+            ctype = np.complex64 if data.dtype == np.float32 else np.complex128
+            arr = data.astype(np.float64 if ctype == np.complex128 else np.float32, copy=False).view(ctype)
+            cache[key] = arr
+            while len(cache) > 1 and sum(v.nbytes for v in cache.values()) > self.H5_CACHE_BYTES:
+                cache.popitem(last=False)
+        else:
+            cache.move_to_end(key)
+        return arr[..., k]
 
     def compute_power_and_mode_coupling(self):
         """
@@ -1366,11 +1466,23 @@ class FSPModelData:
         def integ(F2, y_arr, z_arr):
             return TRAPZ(TRAPZ(F2, y_arr, axis=1), z_arr, axis=0)
 
+        P[:] = np.nan
+        eta[:] = np.nan
         for i, pt in enumerate(self.ports):
-            m = pt["h5_group"]
-            if m not in self.h5:
-                raise RuntimeError(f"HDF5 group '{m}' for port '{pt['name']}' not found in .h5 file.")
-            ys, zs, M, _, _ = self.stored_mode(pt["name"])
+            xs[i] = pt["x"]
+            src = self.plane_source(pt["name"])
+            if not src or src[0] != "h5":  # e.g. a disabled port: recorded nothing
+                continue
+            m = src[1]
+            try:
+                ys, zs, M, _, _ = self.stored_mode(pt["name"])
+            except Exception:  # no stored mode: only the power
+                ys = zs = M = None
+            if M is None:
+                for k in range(n_freqs):
+                    pw = self.plane_power(pt["name"], k)
+                    P[i, k] = np.nan if pw is None else pw
+                continue
             keep = ys >= -1e-9
             ys = ys[keep]
             M = {k: v[:, keep] for k, v in M.items()}
@@ -1395,7 +1507,10 @@ class FSPModelData:
                 d = integ(np.real(Ei["Ey"] * np.conj(Ei["Hz"]) - Ei["Ez"] * np.conj(Ei["Hy"])), ys, zs)
                 eta[i, k] = np.real(a * b / c) / d
 
-        Prel = P / P[0]
+        valid = [i for i in range(n_ports) if np.isfinite(P[i]).any()]
+        if not valid:
+            raise RuntimeError("No port has a recorded field in the .h5 file.")
+        Prel = P / P[valid[0]]
         Tmode = Prel * eta
         self._power_cache = (xs, freqs, lam, P, Prel, eta, Tmode)
         return self._power_cache
@@ -4374,9 +4489,11 @@ class FSPGuiApp:
             raise RuntimeError("No port or monitor plane holds a power result or the E and H fields "
                                "needed to compute it.")
         ref_name, _, ref = planes[0]
-        ps = self.model.source_power()
-        if ps is not None and ps[k_freq]:
-            ref_name, ref = "source", float(ps[k_freq])  # P / P_source: the transmission
+        pref = self.model.power_reference()
+        ps = None
+        if pref is not None and pref[0][k_freq]:
+            ps = pref[0]  # P / P_source (the transmission), or P / P(first plane at the source)
+            ref_name, ref = ("source" if pref[2] else pref[1][2:-1]), float(ps[k_freq])
         if not ref:
             raise RuntimeError(f"The first plane ({ref_name}) carries no power.")
         port_names = {pt["name"] for pt in self.model.ports}
@@ -4407,9 +4524,10 @@ class FSPGuiApp:
             a2 = axs[1]
             _, lam_all, _ = self.model.get_frequencies_and_wavelengths()
             order = np.argsort(lam_all)
-            ref_spec = ps if ref_name == "source" else spectra[ref_name]
+            ref_spec = ps if ps is not None else spectra[ref_name]
             cmap = matplotlib.colormaps["viridis"]
-            for i, (name, x, _) in enumerate(planes if ref_name == "source" else planes[1:], start=1):
+            shown = [pl for pl in planes if ref_name == "source" or pl[0] != ref_name]
+            for i, (name, x, _) in enumerate(shown, start=1):
                 t = spectra[name] / np.where(ref_spec == 0, np.nan, ref_spec)
                 a2.plot(lam_all[order], t[order], lw=1.4, color=cmap(i / max(1, len(planes) - 1)),
                         label=f"{name} (x={x:.4g} μm)")
@@ -4448,29 +4566,26 @@ class FSPGuiApp:
         _, lam_all, _ = self.model.get_frequencies_and_wavelengths()
         order = np.argsort(lam_all)
         lam_s = lam_all[order]
-        ps = self.model.source_power()
+        pref = self.model.power_reference()
+        if pref is None:
+            raise RuntimeError("Neither a source power nor a plane at the source to normalise the powers to.")
         a1, a2 = fig.subplots(1, 2)
         self._style_mpl_axes([a1, a2])
         cmap = matplotlib.colormaps["viridis"]
-        ref_label = "P / P_source"
-        ref_spec = None
-        if ps is None:  # no source spectrum stored: relative to the first plane
-            ref_spec = self.model.plane_power_spectrum(self.model.field_planes()[0])
-            ref_label = f"P / P({self.model.field_planes()[0]})"
+        ref_label = f"P / {pref[1]}"
         header = ["wavelength_nm"]
         cols = []
         for i, name in enumerate(names):
-            T = self.model.plane_transmission(name) if ps is not None else (
-                None if ref_spec is None else self.model.plane_power_spectrum(name) / ref_spec)
+            T = self.model.plane_transmission(name)
             if T is None:
                 continue
             color = cmap(i / max(1, len(names) - 1)) if len(names) > 1 else THEME["monitor_cyan"]
             x = self.model.plane_grid(name)[0]
             a1.plot(lam_s, T[order], lw=1.8, color=color, label=f"{name} (x={x:.4g} μm)")
             a2.plot(lam_s, 10 * np.log10(np.clip(T[order], 1e-12, None)), lw=1.8, color=color, label=name)
-            header.append(f"{name}_P_over_Psource")
+            header.append(f"{name}_P_over_{'Psource' if pref[2] else 'Pref'}")
             cols.append(T[order])
-            mt = self.model.plane_mode_transmission(name) if ps is not None else None
+            mt = self.model.plane_mode_transmission(name)
             if mt is not None and mt[2] is not None:
                 a1.plot(lam_s, mt[2][order], ls="--", lw=1.4, color=color, label=f"{name}: in mode of {mt[0]}")
                 a2.plot(lam_s, 10 * np.log10(np.clip(mt[2][order], 1e-12, None)), ls="--", lw=1.4, color=color)
@@ -4488,7 +4603,8 @@ class FSPGuiApp:
         a2.set_ylabel(f"{ref_label} (dB)")
         a2.set_title("Transmission (dB)", fontsize=9.5)
         a1.legend(fontsize=7.5, facecolor="#1a1e25", edgecolor=THEME["border"], labelcolor=THEME["text"], loc="best")
-        fig.suptitle(f"Power spectrum through {names[0] if len(names) == 1 else f'{len(names)} planes'}",
+        note = "" if pref[2] else f"  (relative to {pref[1][2:-1]}: the field file has no absolute power scale)"
+        fig.suptitle(f"Power spectrum through {names[0] if len(names) == 1 else f'{len(names)} planes'}{note}",
                      color=THEME["text"], fontsize=10.5, fontweight="bold")
         fig.set_layout_engine("constrained")
         rows = ["\t".join(header)] + ["\t".join([f"{l:.3f}"] + [f"{c[j]:.6g}" for c in cols]) for j, l in enumerate(lam_s)]
@@ -4498,10 +4614,12 @@ class FSPGuiApp:
     def _plot_s_parameters(self, fig: Figure, k_freq: int, lam: np.ndarray):
         """|S_i1|^2 of every plane from the stored powers: P_i / P_source (all modes) and, where the
         plane has a stored mode, the power in that mode; S11 estimated from the power balance."""
-        ps = self.model.source_power()
-        if ps is None:
-            raise RuntimeError("The project stores no source power spectrum (P0 of the source): "
-                               "S-parameters cannot be normalised.")
+        pref = self.model.power_reference()
+        if pref is None:
+            raise RuntimeError("The project stores no source power spectrum (P0 of the source) and no plane "
+                               "at the source: S-parameters cannot be normalised.")
+        absolute = pref[2]
+        ref_plane = None if absolute else pref[1][2:-1]
         planes = [n for n in self.model.field_planes() if self.model.plane_transmission(n) is not None]
         if not planes:
             raise RuntimeError("No plane holds a power spectrum.")
@@ -4515,7 +4633,7 @@ class FSPGuiApp:
         self._style_mpl_axes([a1, a2])
         cmap = matplotlib.colormaps["viridis"]
         header, cols = ["wavelength_nm"], []
-        downstream = [n for n in planes if x_src is None or self.model.plane_grid(n)[0] > x_src + 0.01]
+        downstream = [n for n in planes if n != ref_plane and (x_src is None or self.model.plane_grid(n)[0] > x_src + 0.01)]
         for i, name in enumerate(downstream):
             T = self.model.plane_transmission(name)
             color = cmap(i / max(1, len(downstream) - 1))
@@ -4529,7 +4647,7 @@ class FSPGuiApp:
                         label=f"{name} → mode of {mt[0]}")
                 header += [f"|S|^2_mode_{name}", f"|S|_mode_{name}"]
                 cols += [mt[2][order], np.sqrt(np.clip(mt[2][order], 0, None))]
-        if downstream and x_src is not None:
+        if downstream and x_src is not None and absolute:
             # power balance at the first plane after the source: P = P_source - P_reflected
             first = downstream[0]
             R = 1.0 - self.model.plane_transmission(first)
@@ -4544,9 +4662,10 @@ class FSPGuiApp:
             ax.grid(alpha=0.25, color=THEME["grid_axis"])
             if ax.get_legend_handles_labels()[0]:
                 ax.legend(fontsize=7.5, facecolor="#1a1e25", edgecolor=THEME["border"], labelcolor=THEME["text"], loc="best")
-        a1.set_title("|S_i1|² = P_i / P_source (all power)", fontsize=9.5)
-        a2.set_title("|S_i1|² in the stored mode; |S11|²", fontsize=9.5)
-        fig.suptitle("S-parameter magnitudes from the stored powers",
+        a1.set_title(f"|S_i1|² = P_i / {pref[1]} (all power)", fontsize=9.5)
+        a2.set_title("|S_i1|² in the stored mode; |S11|²" if absolute else "|S_i1|² in the stored mode", fontsize=9.5)
+        fig.suptitle("S-parameter magnitudes from the stored powers" + ("" if absolute else
+                     f"  (relative to {ref_plane}: the field file has no absolute power scale, so no |S11|²)"),
                      color=THEME["text"], fontsize=10.5, fontweight="bold")
         fig.set_layout_engine("constrained")
         rows = ["\t".join(header)] + ["\t".join([f"{l:.3f}"] + [f"{c[j]:.6g}" for c in cols]) for j, l in enumerate(lam_s)]
@@ -4559,7 +4678,8 @@ class FSPGuiApp:
         self._style_mpl_axes([a1, a2])
 
         start_idx = 1 if len(xs) > 1 else 0
-        for k in range(len(freqs)):
+        shown = range(len(freqs)) if len(freqs) <= 9 else np.unique(np.linspace(0, len(freqs) - 1, 7).round().astype(int))
+        for k in shown:  # at most 7 wavelengths of a long list, to keep the legend readable
             a1.plot(xs[start_idx:], Prel[start_idx:, k], "o-", label=f"{lam[k]:.0f} nm", lw=1.8, markersize=5)
             a2.plot(xs[start_idx:], Tmode[start_idx:, k], "s-", label=f"{lam[k]:.0f} nm", lw=1.8, markersize=5)
 
@@ -4610,6 +4730,10 @@ class FSPGuiApp:
             indices = [i for i, pt in enumerate(self.model.ports) if pt["name"] == port_sel]
         else:
             indices = list(range(1, len(self.model.ports))) if len(self.model.ports) > 1 else [0]
+        indices = [i for i in indices if np.isfinite(Prel[i]).any()]  # ports that recorded a field
+        if not indices:
+            raise RuntimeError(f"{'This port has' if port_sel != 'All Ports' else 'The ports have'} no recorded "
+                               "field in the .h5 file (a disabled port records nothing).")
 
         rows = ["wavelength_nm\tport\tx_um\tP_over_Pin\tTmode_over_Pin\tInsertionLoss_dB"]
         for i in indices:
@@ -4642,10 +4766,19 @@ class FSPGuiApp:
     def _plot_xz_propagation(self, fig: Figure, k_freq: int, lam: np.ndarray):
         if self.model.h5 is None:
             raise RuntimeError("Companion .h5 file is required to plot XZ propagation fields.")
+        def is_xz(grp):  # a y-normal plane: many x, one y
+            try:
+                g = self.model.h5[grp]
+                return g["x"].size > 1 and g["y"].size == 1 and g["z"].size > 1 and "Ex" in g
+            except Exception:
+                return False
         mon_info = self.model.dft_monitors.get("dft_xz_propagation")
-        h5_grp = mon_info["h5_group"] if mon_info and mon_info["h5_group"] else "Monitor7"
-        if h5_grp not in self.model.h5:
-            raise RuntimeError(f"XZ propagation group '{h5_grp}' not found in .h5 file.")
+        h5_grp = mon_info["h5_group"] if mon_info and mon_info["h5_group"] else None
+        if not h5_grp or not is_xz(h5_grp):
+            h5_grp = next((g for g in self.model.h5 if is_xz(g)), None)
+        if h5_grp is None:
+            raise RuntimeError("The .h5 file holds no XZ field monitor (a y-normal plane): the XZ monitor "
+                               "was disabled or not recorded.")
 
         g = self.model.h5[h5_grp]
         x, z = g["x"][()], g["z"][()]
