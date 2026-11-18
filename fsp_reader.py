@@ -426,6 +426,43 @@ def _um(v):
     return f"{v * 1e6:.4g}"
 
 
+def _mesh_accuracy(p):
+    """Mesh accuracy (1-8) of the FDTD region, as shown in Lumerical, with its points per wavelength.
+
+    The file stores it as gridSlider counted from 0 (mesh accuracy 3 is stored as 2), and as
+    targetPPW, the target number of mesh points per wavelength: 6 + 4 * (accuracy - 1).
+    """
+    ppw = p.get("targetPPW")
+    if ppw is not None and ppw >= 6 and (ppw - 6) % 4 == 0:
+        return f"{int((ppw - 6) // 4) + 1} ({ppw:g} points per wavelength)"
+    slider = p.get("gridSlider")
+    return "?" if slider is None else str(int(slider) + 1)
+
+
+def _background(f, p):
+    """Background of the FDTD region: its material (with the index) if one is set, else its index.
+
+    The background material is stored as mMaterialId (a material uuid; all zeros means none,
+    i.e. "<Object defined dielectric>"). mRefIndex is the index of the object defined
+    dielectric and is not used when a material is set; it is stored as text, since Lumerical
+    also accepts an expression there.
+    """
+    uuid = str(p.get("mMaterialId") or "").strip("{}")
+    if uuid and uuid.strip("0-"):
+        name = next((m.get("name") for m in f.materials if str(m.get("materialuuid", "")).strip("{}") == uuid), None)
+        if name is None:
+            return f"material {p['mMaterialId']} (not in the material database)"
+        try:
+            n = f.material_index(name)
+        except KeyError:
+            n = None
+        if n is None:
+            return f"material {name}"
+        n = n[0]
+        return f"material {name} (n={n.real:.6g}{f'{n.imag:+.3g}i' if abs(n.imag) > 0 else ''})"
+    return f"index {p.get('mRefIndex', 1.0)}"
+
+
 def summary(f):
     out = []
     w = out.append
@@ -482,11 +519,11 @@ def summary(f):
         x0, x1 = p["GUIx"] - p["GUIwidth"] / 2, p["GUIx"] + p["GUIwidth"] / 2
         y0, y1 = p["GUIy"] - p["GUIheight"] / 2, p["GUIy"] + p["GUIheight"] / 2
         w(f"  x {_um(x0)} .. {_um(x1)} um, y {_um(y0)} .. {_um(y1)} um, z {_um(p['GUIz1'])} .. {_um(p['GUIz2'])} um")
-        w(f"  simulation time {p['MaxSimTime'] * 1e12:g} ps, auto-shutoff min {p['autoShutoffMin']:g}, background index {p['mRefIndex']}")
+        w(f"  simulation time {p['MaxSimTime'] * 1e12:g} ps, auto-shutoff min {p['autoShutoffMin']:g}, background {_background(f, p)}")
         f1, f2 = p["fStart"], p["fEnd"]
         w(f"  band {f1 / 1e12:.2f} .. {f2 / 1e12:.2f} THz = {C0 / f2 * 1e9:.1f} .. {C0 / f1 * 1e9:.1f} nm, centre {C0 / p['globalFrequency'] * 1e9:.1f} nm")
         w(f"  PML layers (xmin xmax ymin ymax zmin zmax): {p['PMLLayersV7p0'].ravel().tolist()}, extend structure through PML: {p['extendStructure']}")
-        w(f"  mesh accuracy {p['gridSlider']}, grid {len(p['xGrid']) - 1} x {len(p['yGrid']) - 1} x {len(p['zGrid']) - 1} cells")
+        w(f"  mesh accuracy {_mesh_accuracy(p)}, grid {len(p['xGrid']) - 1} x {len(p['yGrid']) - 1} x {len(p['zGrid']) - 1} cells")
         for ax in "xyz":
             g = np.diff(p[f"{ax}Grid"].ravel()) * 1e9
             w(f"    d{ax} {g.min():.1f} .. {g.max():.1f} nm")

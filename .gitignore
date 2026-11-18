@@ -1,4 +1,38 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build output of build_windows.py (PyInstaller: dist/, build/ with the .spec file, the .zip)
 build/
 dist/
-__pycache__/
+*.spec
+*.zip
+
+# Lumerical projects, field data and exports (large, machine-made; keep them next to the models)
+*.fsp
+*.h5
+*.ldf
+*.lms
+*.gds
+*.log
+
+# Editors and IDEs
+.vscode/
+.idea/
+*.swp
+
+# Operating system files
 .DS_Store
+Thumbs.db
+desktop.ini
+
+# Claude Code local settings
+.claude/settings.local.json
