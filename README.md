@@ -2,14 +2,15 @@
 
 <img src="icon.png" width="96" alt="FSP Viewer icon: a black square on a yellow background">
 
-**Version 0.2.0** — see [Version History](#version-history).
+**Version 0.2.1** — see [Version History](#version-history).
 
-View Ansys Lumerical FDTD project files (`.fsp`), plot their results and save their geometry as GDS **without a Lumerical license**, on macOS and Linux (the viewer and the command-line tools also run on Windows).
+View Ansys Lumerical FDTD project files (`.fsp`), plot their results and save their geometry as GDS **without a Lumerical license**, on macOS and Linux, and on Windows as a ready-to-run program that needs no Python (see [Windows application](#windows-application)).
 
 - `fsp_gui.py` — **FSP Viewer**, the application: four geometry views, a parameter inspector, result plots, geometry export, installation and updates.
 - `fsp_reader.py` — reads `.fsp` files; a command-line inspector and a library.
 - `fsp_export.py` — saves the geometry as a GDSII file or as a gdsfactory script.
 - `fsp_plots.py` — writes a fixed set of result figures from the command line.
+- `build_windows.py` — builds the Windows application (`requirements-windows.txt`, `.github/workflows/windows.yml`).
 
 ---
 
@@ -153,7 +154,7 @@ The parameters at the top of `fsp_gui.py`:
 | Parameter | Default | Meaning |
 | :--- | :--- | :--- |
 | `APP_NAME` | `"FSP Viewer"` | Window title and name of the installed application |
-| `APP_VERSION` | `"0.2.0"` | Version number; decides whether a copy on GitHub is newer |
+| `APP_VERSION` | `"0.2.1"` | Version number; decides whether a copy on GitHub is newer |
 | `APP_ICON_YELLOW`, `APP_ICON_BLACK` | `"#ffd700"`, `"#000000"` | Colours of the icon |
 | `APP_ICON_SQUARE` | `0.5` | Side of the black square, as a fraction of the yellow field |
 | `APP_ICON_MARGIN` | `0.1` | Transparent margin on each side, as a fraction of the icon size |
@@ -164,6 +165,29 @@ The parameters at the top of `fsp_gui.py`:
 | `UPDATE_CHECK_DAYS` | `7` | Days between the automatic looks for a new version; 0 turns them off |
 
 The icon is drawn by the program; `icon.png` in this folder is a copy for this page.
+
+---
+
+## Windows application
+
+On Windows FSP Viewer also runs **without Python and without installing anything**: a folder with `FSP Viewer.exe` and its libraries, for example on a simulation server.
+
+1. Download `FSP-Viewer-<version>-windows.zip` from the [newest release](https://github.com/varallyay/fsp_viewer/releases/latest).
+2. Unpack it anywhere (a local disk is faster than a network share). It holds the folder `FSP Viewer`.
+3. Start `FSP Viewer.exe` in it. An `.fsp` file dropped on the `.exe` (or given in a shortcut / on the command line: `"FSP Viewer.exe" model.fsp`) is opened at once.
+
+- Keep the folder together: `FSP Viewer.exe` needs the `_internal` folder next to it. A shortcut to the `.exe` can go on the desktop.
+- Windows may warn at the first start (*Windows protected your PC*), because the program is not signed: **More info > Run anyway**.
+- The program looks for a new version once a week; it cannot replace itself, so it offers the download page of the new release. Unpack the new `.zip` and delete the old folder.
+- Messages and error reports go to `%USERPROFILE%\.fsp_viewer.log` (the program has no console window); settings to `%USERPROFILE%\.fsp_viewer.json`.
+
+**How it is built.** The GitHub Actions workflow `.github/workflows/windows.yml` runs `build_windows.py` on a Windows machine of GitHub whenever a version tag is pushed (`git tag v0.2.1 && git push origin v0.2.1`; the tag must match `APP_VERSION`), and attaches the `.zip` to that release; started by hand (*Actions > Windows build > Run workflow*) it only keeps the `.zip` as a download of the run. `build_windows.py` packs the program with PyInstaller, gives the `.exe` its icon and version information, starts the packed program in a self-test (every library present, the window opens) and makes the `.zip`. To build on a Windows PC yourself:
+
+```bat
+python -m pip install -r requirements-windows.txt
+python build_windows.py                 &REM  -> dist\FSP Viewer\ and dist\FSP-Viewer-<version>-windows.zip
+python build_windows.py model.fsp       &REM  the self-test also opens model.fsp and draws every result
+```
 
 ---
 
@@ -233,6 +257,11 @@ Nodes tagged `1000` (structures and layer-builder internals) start with a partly
 ---
 
 ## Version History
+
+### 0.2.1 — 2026-11-18
+- **Windows application** without Python: `build_windows.py` (PyInstaller) and the GitHub Actions workflow `.github/workflows/windows.yml`, which attaches `FSP-Viewer-<version>-windows.zip` to each release. The packed program is self-tested during the build (`--self-test`).
+- A copy that cannot update itself (the Windows application, or a copy that is not installed) looks for new versions too and offers the download page of the new release.
+- Windows: menus show Ctrl instead of Cmd, Ctrl+Q quits; Install / Uninstall are not offered where they are not supported; a packaged program writes its messages to `~/.fsp_viewer.log`.
 
 ### 0.2.0 — 2026-11-17
 - **Large files**: a project of many GB is memory-mapped instead of read; results are read when a plot needs them, a field at one wavelength alone (a 10.7 GB project opens in under a second with about 0.4 GB of memory, instead of 23 GB).

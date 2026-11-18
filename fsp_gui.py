@@ -82,7 +82,7 @@ os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 # Application parameters - edit these to customise the app
 # ======================================================================
 APP_NAME = "FSP Viewer"         # Window title, name of the installed application and (macOS) menu-bar name
-APP_VERSION = "0.2.0"           # See the version history in README.md
+APP_VERSION = "0.2.1"           # See the version history in README.md
 APP_DESCRIPTION = "Lumerical FSP 3D Viewer & Results Analyzer"
 APP_SLUG = "fsp_viewer"         # Folder and file names of the installation
 APP_CLASS = "Fsp_viewer"        # Window class (Linux: connects the windows to the menu entry)
@@ -2850,6 +2850,87 @@ def app_icon_photo(root, size=256, margin=APP_ICON_MARGIN):
         return None
 
 
+def _log_to_file():
+    """A packaged application has no console (sys.stdout / sys.stderr are None): its messages
+    and error reports go to LOG_FILE in the home folder instead."""
+    if sys.stdout is not None and sys.stderr is not None:
+        return
+    try:
+        log = open(os.path.expanduser(LOG_FILE), "a", encoding="utf-8", buffering=1)
+    except OSError:
+        return
+    log.write(f"--- {APP_NAME} {APP_VERSION} started {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    sys.stdout = sys.stdout or log
+    sys.stderr = sys.stderr or log
+
+
+def self_test(report, fsp=None):
+    """Starts the program without user interaction and checks that every library it needs is
+    there and works (the Windows build runs this on the packaged program). With an .fsp file,
+    every result is also plotted. Writes a report; returns 0 if all went well, else 1."""
+    lines, failed = [f"{APP_NAME} {APP_VERSION} self-test, Python {sys.version.split()[0]}, "
+                     f"{sys.platform}, packaged={FROZEN}"], []
+
+    def check(name, fn):
+        try:
+            detail = fn()
+            lines.append(f"ok    {name}" + (f": {detail}" if detail else ""))
+        except Exception as err:
+            failed.append(name)
+            lines.append(f"FAIL  {name}: {type(err).__name__}: {err}")
+
+    def need(module, what):
+        if module is None:
+            raise ImportError(f"{what} is missing")
+        return getattr(module, "__version__", "")
+
+    try:
+        import scipy
+    except ImportError:
+        scipy = None
+    check("numpy", lambda: np.__version__ + f", sum={np.arange(10).sum()}")
+    check("matplotlib", lambda: matplotlib.__version__ + f", backend {matplotlib.get_backend()}")
+    check("h5py", lambda: need(h5py, "h5py"))
+    check("scipy.interpolate", lambda: need(scipy, "scipy") if RegularGridInterpolator else need(None, "scipy"))
+    check("Pillow icon", lambda: f"{app_icon_image(64).size}")
+    root = None
+    try:
+        root = tk.Tk(className=APP_CLASS)
+        check("Tk", lambda: f"Tk {root.tk.call('info', 'patchlevel')}")
+        app = FSPGuiApp(root, initial_fsp=fsp)
+        root.update()
+        deadline = time.time() + 120  # the file given at the start is opened by a scheduled call
+        while fsp and app.model is None and time.time() < deadline:
+            root.update()
+            time.sleep(0.05)
+        check("window", lambda: f"{root.winfo_width()}x{root.winfo_height()}")
+        check("icon image", lambda: "" if app_icon_photo(root, 64) is not None else need(None, "Pillow ImageTk"))
+        if fsp:
+            check("open file", lambda: f"{len(app.model.structures)} structures, {len(app.model.ports)} ports"
+                                       if app.model is not None else need(None, "the model"))
+            for option in app.RESULT_OPTIONS:
+                def plot(option=option):
+                    app.result_var.set(option)
+                    app.plot_selected()
+                    root.update()
+                    texts = [t.get_text() for ax in app.fig.axes for t in ax.texts if t.get_text().startswith("Cannot")]
+                    return texts[0].replace("\n", " ")[:160] if texts else ""
+                check(f"plot: {option}", plot)
+    except Exception as err:
+        failed.append("start")
+        lines.append(f"FAIL  start: {type(err).__name__}: {err}")
+    finally:
+        if root is not None:
+            try:
+                root.destroy()
+            except tk.TclError:
+                pass
+    lines.append("RESULT: " + ("all ok" if not failed else "FAILED: " + ", ".join(failed)))
+    with open(report, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return 1 if failed else 0
+
+
 def bring_to_front(root):
     """Shows the window in front of the others, also when started from a terminal.
     lift() alone leaves it behind the terminal on macOS (and on another desktop when the
@@ -2914,6 +2995,11 @@ LINUX_USER_BIN = "~/.local/bin"
 
 THIS_SCRIPT = os.path.realpath(__file__)
 MAIN_FILE = APP_FILES[0]
+# A packaged application (e.g. "FSP Viewer.exe" built with PyInstaller, see build_windows.py):
+# it runs without Python, so it cannot install or update itself; new versions are downloaded.
+FROZEN = bool(getattr(sys, "frozen", False))
+RELEASES_PAGE = APP_WEBSITE + "/releases/latest"
+LOG_FILE = "~/.fsp_viewer.log"  # messages and errors of a packaged application (it has no console)
 
 
 def load_config():
@@ -3526,30 +3612,35 @@ class FSPGuiApp:
             self.root.after(100, lambda: self.open_fsp_file(initial_fsp, initial_h5))
 
     def _build_menu(self):
+        mod = "Cmd" if sys.platform == "darwin" else "Ctrl"
         menubar = tk.Menu(self.root)
         file_menu = tk.Menu(menubar, tearoff=0)
-        file_menu.add_command(label="Open .fsp File…", command=self.browse_fsp, accelerator="Cmd+O")
+        file_menu.add_command(label="Open .fsp File…", command=self.browse_fsp, accelerator=f"{mod}+O")
         file_menu.add_command(label="Open .h5 Field File…", command=self.browse_h5)
         file_menu.add_separator()
         file_menu.add_command(label="Save Geometry as GDS File…", command=lambda: self.save_geometry("gds"))
         file_menu.add_command(label="Save Geometry as Python (gdsfactory) Script…",
                               command=lambda: self.save_geometry("py"))
         file_menu.add_separator()
-        file_menu.add_command(label="Export Plot Data to Clipboard", command=self.export_data_to_clipboard, accelerator="Cmd+C")
+        file_menu.add_command(label="Export Plot Data to Clipboard", command=self.export_data_to_clipboard,
+                              **({"accelerator": "Cmd+C"} if sys.platform == "darwin" else {}))
         file_menu.add_separator()
-        file_menu.add_command(label="Quit", command=self.root.quit, accelerator="Cmd+Q")
+        file_menu.add_command(label="Quit", command=self.root.quit, accelerator=f"{mod}+Q")
         menubar.add_cascade(label="File", menu=file_menu)
         help_menu = tk.Menu(menubar, tearoff=0)
         help_menu.add_command(label=f"About {APP_NAME}", command=self.show_about)
         help_menu.add_command(label="Check for Updates…", command=self.check_for_update_now)
-        help_menu.add_separator()
-        help_menu.add_command(label=f"Install {APP_NAME}…", command=self.ask_install)
-        help_menu.add_command(label="Uninstall…", command=self.ask_uninstall)
+        if install_target(False) is not None and not FROZEN:  # installing: macOS and Linux
+            help_menu.add_separator()
+            help_menu.add_command(label=f"Install {APP_NAME}…", command=self.ask_install)
+            help_menu.add_command(label="Uninstall…", command=self.ask_uninstall)
         help_menu.add_separator()
         help_menu.add_command(label="GitHub Page", command=lambda: webbrowser.open(APP_WEBSITE))
         menubar.add_cascade(label="Help", menu=help_menu)
         self.root.config(menu=menubar)
         self.root.bind_all("<Command-o>" if sys.platform == "darwin" else "<Control-o>", lambda e: self.browse_fsp())
+        if sys.platform != "darwin":  # macOS has Cmd+Q of its own
+            self.root.bind_all("<Control-q>", lambda e: self.root.quit())
 
     def _build_ui(self):
         T = THEME
@@ -4778,7 +4869,8 @@ class FSPGuiApp:
             if not config.get("first_start_done"):
                 config["first_start_done"] = True
                 save_config(config)
-            if update_check_due(config) and installed_copy(platform):
+            if update_check_due(config) and (installed_copy(platform) or FROZEN
+                                             or install_target(False, platform) is None):
                 self.check_for_update(platform)
             return
         if question == "install":
@@ -4898,13 +4990,7 @@ class FSPGuiApp:
             return
         remember_update_check()
         if installed is None and is_newer(latest["version"], APP_VERSION):
-            choice = self.message(
-                "Check for Updates",
-                f"{APP_NAME} {latest['version']} is available on GitHub; you are using version {APP_VERSION}.\n\n"
-                f"Only an installed {APP_NAME} updates itself (Help > Install {APP_NAME}). You can also "
-                "download the new version from GitHub.", [("github", "Open GitHub Page"), ("ok", "Close")])
-            if choice == "github":
-                webbrowser.open(APP_WEBSITE)
+            self.offer_download(latest, asked=True)
             return
         current = installed["version"] if installed is not None else APP_VERSION
         self.message("Check for Updates", f"{APP_NAME} {current} is up to date.\n\n"
@@ -4918,7 +5004,10 @@ class FSPGuiApp:
         remember_update_check()
         config = load_config()
         installed = installed_copy(platform)
-        if (installed is None or not is_newer(latest["version"], installed["version"])
+        if installed is None:  # a packaged application, or a copy that is not installed
+            self.offer_download(latest, asked)
+            return
+        if (not is_newer(latest["version"], installed["version"])
                 or (not asked and config.get("skipped_version") == latest["version"])):
             return
         choice = AppDialog(
@@ -4952,6 +5041,36 @@ class FSPGuiApp:
                         "The file that is open now is opened again.",
                         [("restart", "Restart now"), ("later", "Later")]) == "restart":
             self.restart(installed["script"])
+
+    def offer_download(self, latest, asked=False):
+        """A newer version for a copy that cannot update itself (the Windows application, or a
+        copy that is not installed): offer the download page of the newest GitHub release."""
+        config = load_config()
+        if not is_newer(latest["version"], APP_VERSION) or (
+                not asked and config.get("skipped_version") == latest["version"]):
+            return
+        if FROZEN and sys.platform.startswith("win"):
+            how = (f"Download FSP-Viewer-{latest['version']}-windows.zip from the release page, unpack it "
+                   f"and start '{APP_NAME}.exe' in the new folder (the old folder can then be deleted).")
+        elif install_target(False) is not None:
+            how = (f"Download it from GitHub, or install {APP_NAME} (Help > Install), "
+                   "which then updates itself.")
+        else:
+            how = "Download it from the GitHub release page."
+        choice = AppDialog(
+            self.root, f"New version of {APP_NAME}",
+            f"{APP_NAME} {latest['version']} is available; you are using version {APP_VERSION}.\n\n{how}",
+            [("open", "Open Download Page"), ("later", "Not now"), ("skip", "Skip this version")],
+            note=f"From github.com/{UPDATE_REPOSITORY}. Help > Check for Updates looks for a new version at any time.",
+            icon=self.dialog_icon(), checkbox=self._weekly_checkbox(config.get("check_updates", True))).show()
+        config = load_config()
+        if self.weekly is not None and choice is not None:
+            config["check_updates"] = bool(self.weekly.get())
+        if choice == "skip":
+            config["skipped_version"] = latest["version"]
+        save_config(config)
+        if choice == "open":
+            webbrowser.open(RELEASES_PAGE)
 
     def restart(self, script):
         """Close the window and run `script` (the updated program) in place of this process,
@@ -5056,7 +5175,12 @@ def main(argv=None):
     action.add_argument("--update", action="store_true",
                         help="install a newer version from GitHub over the installed one, then exit")
     parser.add_argument("--version", action="version", version=f"{APP_NAME} {APP_VERSION}")
-    args, _ = parser.parse_known_args(argv)  # macOS may add an argument such as -psn_0_123 from Finder
+    parser.add_argument("--self-test", metavar="REPORT", help=argparse.SUPPRESS)  # used by build_windows.py
+    if FROZEN:
+        _log_to_file()
+    args, _ = parser.parse_known_args(argv)
+    if args.self_test:
+        return self_test(args.self_test, os.path.abspath(args.fsp) if args.fsp else None)  # macOS may add an argument such as -psn_0_123 from Finder
     if args.install or args.install_systemwide or args.uninstall or args.update:
         if args.update:
             ok, message = update_installed_app()
