@@ -1,0 +1,161 @@
+# Builds FSP Viewer as an application without Python for every system (build_app.py), tests
+# the packages, and attaches them to the GitHub release of a version tag:
+#
+#   FSP-Viewer-<version>-windows.zip        Windows (x64)
+#   FSP-Viewer-<version>-macos-arm64.dmg    macOS, Apple silicon
+#   FSP-Viewer-<version>-macos-x86_64.dmg   macOS, Intel
+#   fsp-viewer_<version>_amd64.deb          Linux: Debian, Ubuntu, Mint, ...
+#   fsp-viewer-<version>-1.x86_64.rpm       Linux: Fedora, RHEL, openSUSE, ...
+#
+#  - On a version tag (git tag v0.2.5 && git push origin v0.2.5): the release of the tag is
+#    made (or completed) once every package is built and tested. The tag must match
+#    APP_VERSION in fsp_gui.py. The packaged programs update themselves from these files.
+#  - Started by hand (Actions > Release build > Run workflow): the packages are kept as
+#    downloads of the run (Artifacts); nothing is published.
+name: Release build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write  # to make the release and attach the packages
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    # GitHub's Intel Macs are being retired: without one, the release has no Intel .dmg
+    continue-on-error: ${{ matrix.optional }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Windows, id: windows, os: windows-latest, optional: false }
+          - { name: macOS Apple silicon, id: macos-arm64, os: macos-15, optional: false }
+          - { name: macOS Intel, id: macos-x86_64, os: macos-15-intel, optional: true }
+          # the oldest Ubuntu GitHub offers: the program then runs with glibc 2.35 or newer
+          - { name: Linux, id: linux, os: ubuntu-22.04, optional: false }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-build.txt
+
+      - name: Linux packaging tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm xvfb xauth
+
+      - name: Install the build packages
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+
+      - name: Version
+        id: version
+        shell: bash
+        run: |
+          version=$(python -c "import re; print(re.search(r'^APP_VERSION\s*=\s*\"([^\"]+)\"', open('fsp_gui.py', encoding='utf-8').read(), re.M).group(1))")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "APP_VERSION is $version"
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::The tag $GITHUB_REF_NAME does not match APP_VERSION $version in fsp_gui.py."
+            exit 1
+          fi
+
+      # PyInstaller, a self-test of the built program, the packages, and (Windows, macOS) a test
+      # that updates a copy of the program from its package the way the program does it
+      - name: Build, self-test and pack
+        run: python build_app.py
+
+      - name: Test the .deb (install it and start the installed program)
+        if: runner.os == 'Linux'
+        run: |
+          v=${{ steps.version.outputs.version }}
+          sudo apt-get install -y "./dist/release/fsp-viewer_${v}_amd64.deb"
+          xvfb-run -a fsp-viewer --self-test /tmp/deb-test.txt || true
+          cat /tmp/deb-test.txt
+          grep -q "RESULT: all ok" /tmp/deb-test.txt
+          grep -q "updates: from the GitHub releases (deb)" /tmp/deb-test.txt
+          test -f /usr/share/applications/fsp-viewer.desktop
+          sudo apt-get remove -y fsp-viewer
+          test ! -e /opt/fsp-viewer
+
+      - name: Test the .rpm (install it on Fedora and start the installed program)
+        if: runner.os == 'Linux'
+        run: |
+          v=${{ steps.version.outputs.version }}
+          docker run --rm -v "$PWD/dist/release:/release:ro" fedora:latest bash -c "
+            set -e
+            dnf install -y --nogpgcheck /release/fsp-viewer-${v}-1.x86_64.rpm xorg-x11-server-Xvfb dejavu-sans-fonts
+            Xvfb :99 & sleep 2
+            DISPLAY=:99 fsp-viewer --self-test /tmp/rpm-test.txt || true
+            cat /tmp/rpm-test.txt
+            grep -q 'RESULT: all ok' /tmp/rpm-test.txt
+            grep -q 'updates: from the GitHub releases (rpm)' /tmp/rpm-test.txt
+            dnf remove -y fsp-viewer
+            test ! -e /opt/fsp-viewer"
+
+      - name: Keep the packages as downloads of this run
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.id }}
+          path: dist/release/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish the release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: packages-*
+          merge-multiple: true
+          path: release
+
+      - name: Release notes (from the version history in README.md)
+        run: |
+          python3 - "${GITHUB_REF_NAME#v}" > notes.md <<'EOF'
+          import re, sys
+          version = sys.argv[1]
+          text = open("README.md", encoding="utf-8").read()
+          m = re.search(rf"^### {re.escape(version)}\b[^\n]*\n(.*?)(?=^#{{2,3}} |\Z)", text, re.S | re.M)
+          print(m.group(1).strip() if m else f"FSP Viewer {version}")
+          print(f"""
+          ### Downloads
+          | System | File |
+          | :--- | :--- |
+          | Windows (x64) | `FSP-Viewer-{version}-windows.zip`: unpack anywhere, start `FSP Viewer.exe` |
+          | macOS, Apple silicon | `FSP-Viewer-{version}-macos-arm64.dmg`: drag FSP Viewer to Applications |
+          | macOS, Intel | `FSP-Viewer-{version}-macos-x86_64.dmg` |
+          | Debian, Ubuntu, Mint | `fsp-viewer_{version}_amd64.deb`: `sudo apt install ./fsp-viewer_{version}_amd64.deb` |
+          | Fedora, RHEL, openSUSE | `fsp-viewer-{version}-1.x86_64.rpm`: `sudo dnf install ./fsp-viewer-{version}-1.x86_64.rpm` |
+          | Python (any system) | `fsp_gui.py`, `fsp_reader.py`, `fsp_export.py` in the source code |
+
+          The installed programs look for new versions on GitHub and update themselves.
+          """)
+          EOF
+          cat notes.md
+          ls -l release
+
+      - name: Make the release and attach the packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --notes-file notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" --title "FSP Viewer ${GITHUB_REF_NAME#v}" --notes-file notes.md
+          fi
+          gh release upload "$GITHUB_REF_NAME" release/* --clobber

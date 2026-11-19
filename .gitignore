@@ -10,11 +10,14 @@ __pycache__/
 venv/
 env/
 
-# Build output of build_windows.py (PyInstaller: dist/, build/ with the .spec file, the .zip)
+# Build output of build_app.py (PyInstaller: dist/, build/ with the .spec file, the packages)
 build/
 dist/
 *.spec
 *.zip
+*.dmg
+*.deb
+*.rpm
 
 # Lumerical projects, field data and exports (large, machine-made; keep them next to the models)
 *.fsp

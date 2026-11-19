@@ -2,15 +2,31 @@
 
 <img src="icon.png" width="96" alt="FSP Viewer icon: a black square on a yellow background">
 
-**Version 0.2.4** — see [Version History](#version-history).
+**Version 0.2.5** — see [Version History](#version-history).
 
-View Ansys Lumerical FDTD project files (`.fsp`), plot their results and save their geometry as GDS **without a Lumerical license**, on macOS and Linux, and on Windows as a ready-to-run program that needs no Python (see [Windows application](#windows-application)).
+View Ansys Lumerical FDTD project files (`.fsp`), plot their results and save their geometry as GDS **without a Lumerical license** — as a ready-to-run application that needs no Python, for Windows, macOS and Linux (see [Download](#download)), or as a Python program on any system.
 
 - `fsp_gui.py` — **FSP Viewer**, the application: four geometry views, a parameter inspector, result plots, geometry export, installation and updates.
 - `fsp_reader.py` — reads `.fsp` files; a command-line inspector and a library.
 - `fsp_export.py` — saves the geometry as a GDSII file or as a gdsfactory script.
 - `fsp_plots.py` — writes a fixed set of result figures from the command line.
-- `build_windows.py` — builds the Windows application (`requirements-windows.txt`, `.github/workflows/windows.yml`).
+- `build_app.py` — builds the applications without Python for a release (`requirements-build.txt`, `.github/workflows/release.yml`).
+
+---
+
+## Download
+
+Every [release](https://github.com/varallyay/fsp_viewer/releases/latest) carries FSP Viewer as an application that needs **no Python**:
+
+| System | File | Install |
+| :--- | :--- | :--- |
+| **Windows** (x64) | `FSP-Viewer-<version>-windows.zip` | Unpack anywhere, start `FSP Viewer.exe` |
+| **macOS**, Apple silicon (macOS 14+) | `FSP-Viewer-<version>-macos-arm64.dmg` | Open it, drag **FSP Viewer** to **Applications** |
+| **macOS**, Intel | `FSP-Viewer-<version>-macos-x86_64.dmg` | The same |
+| **Linux**: Debian, Ubuntu, Mint, … | `fsp-viewer_<version>_amd64.deb` | `sudo apt install ./fsp-viewer_<version>_amd64.deb` |
+| **Linux**: Fedora, RHEL, openSUSE, … | `fsp-viewer-<version>-1.x86_64.rpm` | `sudo dnf install ./fsp-viewer-<version>-1.x86_64.rpm` (openSUSE: `sudo zypper install …`) |
+
+The applications **update themselves**: once a week they look at the newest release, and if there is a newer version they offer to download and install it (see [Updates](#updates-from-github)). Details in [Applications without Python](#applications-without-python). On other systems, or to change the program, use the Python files (below).
 
 ---
 
@@ -65,11 +81,24 @@ At the first start the viewer asks whether to install it: **systemwide**, **only
 
 ### Updates from GitHub
 
-An installed FSP Viewer looks for a new version on <https://github.com/varallyay/fsp_viewer> **once a week**, at the start, without holding up the window. If there is one, it shows the installed and the new version and offers **Update now**, **Not now** or **Skip this version**; after the update it offers to **restart**, and reopens the file that was open.
+FSP Viewer looks for a new version on <https://github.com/varallyay/fsp_viewer> **once a week**, at the start, without holding up the window. If there is one, it shows this and the new version and offers **Update now**, **Not now** or **Skip this version**; after the update it offers to **restart**, and reopens the file that was open.
+
+Where the new version comes from depends on how FSP Viewer runs:
+
+| Running as | Updates from | How |
+| :--- | :--- | :--- |
+| **Python program** (`fsp_gui.py`, installed with `--install`) | the **main branch**: a newer `APP_VERSION` in `fsp_gui.py` there | the program files are downloaded and installed over the installed copy |
+| **Application** from a release (`.zip`, `.dmg`, `.deb`, `.rpm`) | the **newest release** | its own package is downloaded (progress in the status bar) and put in place, see below |
+
+So a new `fsp_gui.py` pushed to GitHub reaches the Python copies at once, and the applications when a release is made from it.
+
+- **Windows** and **macOS**: the application asks **Restart now** or **When I quit**; the folder `FSP Viewer` (or `FSP Viewer.app`) is replaced by the new version as soon as the program has closed, and with *Restart now* the new version starts with the open file. Its folder must be writable for you; otherwise (e.g. in `C:\Program Files`, or an app on macOS that was not moved to Applications) it opens the download page (macOS: the downloaded disk image) instead.
+- **Linux**: the new `.deb` / `.rpm` is saved in `~/Downloads` and installed by the package manager (`apt`, `dnf`, `zypper`), which asks for your password in a window (`pkexec`). Without that window it shows the command to run, e.g. `sudo apt install ~/Downloads/fsp-viewer_<version>_amd64.deb`.
+- If the release does not (yet) hold the package for your system, the download page is offered instead.
 
 - **Help > Check for Updates…** looks at once and also says when the program is up to date.
 - The checkbox *Look for new versions on GitHub every week* in these dialogs turns the weekly look off or on; `UPDATE_CHECK_DAYS` at the top of `fsp_gui.py` sets the interval.
-- The newest GitHub release is used if the project has releases, otherwise the main branch. All program files are downloaded and checked first; unless every one arrives, nothing is changed.
+- A Python copy downloads all program files and checks them first; unless every one arrives, nothing is changed.
 - A copy that is not installed does not replace itself: it tells you that a newer version exists and opens the GitHub page. Started from a folder with a newer version than the installed one, it offers to update the installed copy from itself.
 - `python3 fsp_gui.py --update` does the same from the terminal.
 
@@ -159,7 +188,7 @@ The parameters at the top of `fsp_gui.py`:
 | Parameter | Default | Meaning |
 | :--- | :--- | :--- |
 | `APP_NAME` | `"FSP Viewer"` | Window title and name of the installed application |
-| `APP_VERSION` | `"0.2.4"` | Version number; decides whether a copy on GitHub is newer |
+| `APP_VERSION` | `"0.2.5"` | Version number; decides whether a copy on GitHub is newer (for the applications: the version tag of the release) |
 | `APP_ICON_YELLOW`, `APP_ICON_BLACK` | `"#ffd700"`, `"#000000"` | Colours of the icon |
 | `APP_ICON_SQUARE` | `0.5` | Side of the black square, as a fraction of the yellow field |
 | `APP_ICON_MARGIN` | `0.1` | Transparent margin on each side, as a fraction of the icon size |
@@ -167,32 +196,43 @@ The parameters at the top of `fsp_gui.py`:
 | `APP_FILES` | the three `.py` files | The files an installation copies and an update downloads |
 | `CONFIG_FILE` | `"~/.fsp_viewer.json"` | Where the answers and the installation are remembered |
 | `UPDATE_REPOSITORY` | `"varallyay/fsp_viewer"` | The GitHub project with the new versions |
+| `UPDATE_BRANCH` | `"HEAD"` | The branch Python copies update from (`HEAD`: the main branch) |
 | `UPDATE_CHECK_DAYS` | `7` | Days between the automatic looks for a new version; 0 turns them off |
 
 The icon is drawn by the program; `icon.png` in this folder is a copy for this page.
 
 ---
 
-## Windows application
+## Applications without Python
 
-On Windows FSP Viewer also runs **without Python and without installing anything**: a folder with `FSP Viewer.exe` and its libraries, for example on a simulation server.
+The release files of [Download](#download) are FSP Viewer packed with Python and every library it needs (PyInstaller); nothing else has to be installed. An `.fsp` file given to the program (dropped on it, *Open With*, or on the command line) is opened at once.
 
-1. Download `FSP-Viewer-<version>-windows.zip` from the [newest release](https://github.com/varallyay/fsp_viewer/releases/latest).
-2. Unpack it anywhere (a local disk is faster than a network share). It holds the folder `FSP Viewer`.
-3. Start `FSP Viewer.exe` in it. An `.fsp` file dropped on the `.exe` (or given in a shortcut / on the command line: `"FSP Viewer.exe" model.fsp`) is opened at once.
-
-- Keep the folder together: `FSP Viewer.exe` needs the `_internal` folder next to it. A shortcut to the `.exe` can go on the desktop.
+**Windows**: a folder with `FSP Viewer.exe` and its libraries, for example on a simulation server; nothing is installed.
+- Unpack the `.zip` anywhere (a local disk is faster than a network share) and start `FSP Viewer.exe` in the folder `FSP Viewer`. Keep the folder together: the `.exe` needs the `_internal` folder next to it. A shortcut to the `.exe` can go on the desktop; `"FSP Viewer.exe" model.fsp` opens a file.
 - Windows may warn at the first start (*Windows protected your PC*), because the program is not signed: **More info > Run anyway**.
-- The program looks for a new version once a week; it cannot replace itself, so it offers the download page of the new release. Unpack the new `.zip` and delete the old folder.
 - Messages and error reports go to `%USERPROFILE%\.fsp_viewer.log` (the program has no console window); settings to `%USERPROFILE%\.fsp_viewer.json`.
 
-**How it is built.** The GitHub Actions workflow `.github/workflows/windows.yml` runs `build_windows.py` on a Windows machine of GitHub whenever a version tag is pushed (`git tag v0.2.4 && git push origin v0.2.4`; the tag must match `APP_VERSION`), and attaches the `.zip` to that release; started by hand (*Actions > Windows build > Run workflow*) it only keeps the `.zip` as a download of the run. `build_windows.py` packs the program with PyInstaller, gives the `.exe` its icon and version information, starts the packed program in a self-test (every library present, the window opens) and makes the `.zip`. To build on a Windows PC yourself:
+**macOS**: `FSP Viewer.app` in a disk image; Apple silicon needs macOS 14 or newer.
+- Open the `.dmg` and drag **FSP Viewer** onto **Applications**. `.fsp` files can be opened with it from Finder (*Open With*).
+- The application is not notarized by Apple (that needs a paid developer account), so at the first start macOS says it *cannot verify* FSP Viewer. Click **Done**, then open **System Settings > Privacy & Security** and click **Open Anyway** next to the message about FSP Viewer (on macOS 14 and older: right-click the app > **Open**). Or in the Terminal: `xattr -dr com.apple.quarantine "/Applications/FSP Viewer.app"`. This is needed once; the updates it installs itself open without asking.
+- Messages and error reports go to `~/.fsp_viewer.log`.
 
-```bat
-python -m pip install -r requirements-windows.txt
-python build_windows.py                 &REM  -> dist\FSP Viewer\ and dist\FSP-Viewer-<version>-windows.zip
-python build_windows.py model.fsp       &REM  the self-test also opens model.fsp and draws every result
+**Linux**: `.deb` and `.rpm` packages for x86-64 (glibc 2.35 or newer: Ubuntu 22.04, Debian 12, Fedora 36, RHEL 10, openSUSE Leap 16, or newer).
+- They put the program in `/opt/fsp-viewer`, add **FSP Viewer** to the application menu (with its icon, and as a program for `.fsp` files) and the terminal command `fsp-viewer` (`fsp-viewer model.fsp`). Remove it with `sudo apt remove fsp-viewer` or `sudo dnf remove fsp-viewer`.
+- Messages and error reports go to `~/.fsp_viewer.log`.
+
+The **Help > Install / Uninstall** menu items of the Python program are not shown in the applications: they are installed and removed as above.
+
+**How they are built.** The GitHub Actions workflow `.github/workflows/release.yml` runs `build_app.py` on GitHub's Windows, macOS (Apple silicon and Intel) and Linux machines whenever a version tag is pushed (`git tag v0.2.5 && git push origin v0.2.5`; the tag must match `APP_VERSION`). On each, `build_app.py` packs the program with PyInstaller (with icon and version information), starts the packed program in a self-test (every library present, the window opens) and makes the packages; on Windows and macOS it also updates a copy of the program from the new package, the way the program does it. On Linux the workflow installs the `.deb` and starts the installed program, and does the same with the `.rpm` on Fedora. When everything has passed, it makes the release of the tag with the packages and the notes of this version from the [Version History](#version-history). Started by hand (*Actions > Release build > Run workflow*) it only keeps the packages as downloads of the run. To build on your own computer (the packages of that system):
+
+```bash
+python -m pip install -r requirements-build.txt
+python build_app.py                 # -> dist/release/: the .zip (Windows), .dmg (macOS), or .deb and .rpm (Linux)
+python build_app.py model.fsp       # the self-test also opens model.fsp and draws every result
+python build_app.py --formats deb   # only some packages
 ```
+
+Linux needs `dpkg-deb` for the `.deb`, `rpmbuild` for the `.rpm` (`sudo apt install rpm`) and `xvfb-run` for the self-test without a display.
 
 ---
 
@@ -262,6 +302,11 @@ Nodes tagged `1000` (structures and layer-builder internals) start with a partly
 ---
 
 ## Version History
+
+### 0.2.5 — 2026-11-19
+- **Applications for every system** in each release, without Python: the Windows `.zip`, a macOS `.dmg` (Apple silicon and Intel) and Linux `.deb` and `.rpm` packages (`/opt/fsp-viewer`, menu entry, `.fsp` file type, the command `fsp-viewer`). `build_app.py` replaces `build_windows.py`; the workflow `.github/workflows/release.yml` builds, tests and publishes them all.
+- **The applications update themselves** from the newest release: they download their own package (progress in the status bar) and put it in place — Windows and macOS swap the program folder after it closes and start the new version, Linux installs the package with the package manager.
+- **Python copies update from the main branch**: a new `fsp_gui.py` on GitHub is offered without waiting for a release.
 
 ### 0.2.4 — 2026-11-19
 - **2D views**: the layers · ports · monitors summary and the axis stretch moved from the headers of the XY, XZ and YZ views to the status bar (in narrow views it pushed the pointer position out of sight).

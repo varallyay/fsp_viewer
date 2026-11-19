@@ -39,6 +39,7 @@ import gc
 import json
 import math
 import os
+import platform as pyplatform
 import plistlib
 import re
 import shlex
@@ -54,6 +55,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+import zipfile
 from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
@@ -84,7 +86,7 @@ os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 # Application parameters - edit these to customise the app
 # ======================================================================
 APP_NAME = "FSP Viewer"         # Window title, name of the installed application and (macOS) menu-bar name
-APP_VERSION = "0.2.4"           # See the version history in README.md
+APP_VERSION = "0.2.5"           # See the version history in README.md
 APP_DESCRIPTION = "Lumerical FSP 3D Viewer & Results Analyzer"
 APP_SLUG = "fsp_viewer"         # Folder and file names of the installation
 APP_CLASS = "Fsp_viewer"        # Window class (Linux: connects the windows to the menu entry)
@@ -103,6 +105,7 @@ CONFIG_FILE = "~/.fsp_viewer.json"            # Settings file in the home folder
 UPDATE_REPOSITORY = "varallyay/fsp_viewer"    # GitHub project (owner/name) that publishes new versions
 APP_WEBSITE = "https://github.com/" + UPDATE_REPOSITORY
 UPDATE_CHECK_DAYS = 7           # Look for a new version this often (days); 0 = only with Help > Check for Updates
+UPDATE_BRANCH = "HEAD"          # Python copies update from this branch (HEAD: the main branch); applications from releases
 
 __version__ = APP_VERSION
 
@@ -3027,6 +3030,8 @@ def self_test(report, fsp=None):
             time.sleep(0.05)
         check("window", lambda: f"{root.winfo_width()}x{root.winfo_height()}")
         check("icon image", lambda: "" if app_icon_photo(root, 64) is not None else need(None, "Pillow ImageTk"))
+        check("updates", lambda: (f"from the GitHub releases ({packaged_kind() or 'not from a release package'})"
+                                  if FROZEN else "from the main branch on GitHub"))
         if fsp:
             check("open file", lambda: f"{len(app.model.structures)} structures, {len(app.model.ports)} ports"
                                        if app.model is not None else need(None, "the model"))
@@ -3464,7 +3469,7 @@ def startup_question(config, platform=None):
     """What to ask when the program starts: 'install' at the first start, 'update' when an
     older version is installed and this newer one runs from elsewhere, otherwise None."""
     platform = platform or sys.platform
-    if install_target(False, platform) is None or running_installed_copy(platform):
+    if FROZEN or install_target(False, platform) is None or running_installed_copy(platform):
         return None
     if not config.get("first_start_done"):
         return "install"
@@ -3477,14 +3482,17 @@ def startup_question(config, platform=None):
 
 
 # ---- updates from GitHub ---------------------------------------------------------
-# New versions are published in the GitHub project UPDATE_REPOSITORY: the program files
-# (APP_FILES) in its top folder. If the project has GitHub releases, the newest release
-# is used, otherwise the newest version of the main branch. APP_VERSION in its fsp_gui.py
-# decides whether it is newer than the installed copy.
+# New versions are published in the GitHub project UPDATE_REPOSITORY in two ways:
+#  - Python copies (fsp_gui.py run with Python) update from the program files (APP_FILES)
+#    in the top folder of its main branch: a new fsp_gui.py there is a new version.
+#  - Packaged copies (built by build_app.py: the Windows .zip, the macOS .dmg, the Linux
+#    .deb and .rpm) update from the newest GitHub release, which carries them as assets.
+# APP_VERSION in fsp_gui.py, or the version tag of the release, decides what is newer.
 GITHUB_API = "https://api.github.com"
 GITHUB_RAW = "https://raw.githubusercontent.com"
 UPDATE_TIMEOUT = 15          # seconds allowed for each download
 MAX_DOWNLOAD = 5_000_000     # bytes; the largest program file is about 150 kB
+MAX_PACKAGE = 2_000_000_000  # bytes; a packaged release is about 100 MB
 
 
 class UpdateError(Exception):
@@ -3527,19 +3535,12 @@ def _download_program(base, name):
 
 
 def find_latest_version():
-    """The newest version on GitHub: {'version', 'source' (the text of the main program),
-    'files' (its file names), 'base' (its folder URL)}.
+    """The newest Python version on GitHub, on its main branch: {'version', 'source' (the text
+    of the main program), 'files' (its file names), 'base' (its folder URL)}.
 
     Raises UpdateError when GitHub cannot be reached or the file is not a valid program.
     """
-    ref = "HEAD"  # the main branch, used when the project has no releases
-    try:
-        release = json.loads(_download(f"{GITHUB_API}/repos/{UPDATE_REPOSITORY}/releases/latest"))
-        if isinstance(release, dict) and release.get("tag_name"):
-            ref = release["tag_name"]
-    except (OSError, ValueError, UpdateError):  # no releases (404), API limit reached, offline, ...
-        pass
-    base = f"{GITHUB_RAW}/{UPDATE_REPOSITORY}/{urllib.parse.quote(ref)}/"
+    base = f"{GITHUB_RAW}/{UPDATE_REPOSITORY}/{urllib.parse.quote(UPDATE_BRANCH)}/"
     source = _download_program(base, MAIN_FILE)
     match = _VERSION_RE.search(source)
     if not match:
@@ -3608,6 +3609,313 @@ def update_installed_app(platform=None):
     if ok:
         message += f"\nRestart {APP_NAME} to use version {latest['version']}."
     return ok, message
+
+
+# ---- packaged copies: updates from GitHub releases ---------------------------------
+# build_app.py packs the program with PyInstaller for each system, and the workflow
+# .github/workflows/release.yml attaches the packages to the GitHub release of a version
+# tag. A packaged copy downloads the package made for it from the newest release and puts
+# it in its own place:
+#   zip  Windows: the folder "FSP Viewer" is swapped for the new one after the program exits
+#   dmg  macOS: "FSP Viewer.app" is swapped for the one in the disk image after it exits
+#   deb  Linux: the package manager installs the new package (asks for the password)
+#   rpm
+LINUX_PACKAGE = "fsp-viewer"           # name of the Linux packages and of their terminal command
+LINUX_PACKAGE_DIR = "/opt/fsp-viewer"  # where they put the program
+PACKAGE_FORMAT_FILE = "package-format"  # next to the packaged Linux program: "deb" or "rpm"
+RELAUNCH_ENV = {"PYINSTALLER_RESET_ENVIRONMENT": "1"}  # a restarted packaged program starts afresh
+
+
+def machine_arch():
+    """The processor: 'x86_64' or 'arm64' (others as Python names them)."""
+    machine = pyplatform.machine().lower()
+    return {"amd64": "x86_64", "x64": "x86_64", "aarch64": "arm64"}.get(machine, machine)
+
+
+def release_asset_name(version, kind, arch=None):
+    """The file name of a package in a GitHub release (build_app.py makes them with these names)."""
+    arch = arch or machine_arch()
+    slug = APP_NAME.replace(" ", "-")
+    if kind == "zip":
+        return f"{slug}-{version}-windows.zip"
+    if kind == "dmg":
+        return f"{slug}-{version}-macos-{arch}.dmg"
+    if kind == "deb":
+        return f"{LINUX_PACKAGE}_{version}_{ {'x86_64': 'amd64'}.get(arch, arch)}.deb"
+    if kind == "rpm":
+        return f"{LINUX_PACKAGE}-{version}-1.{ {'arm64': 'aarch64'}.get(arch, arch)}.rpm"
+    raise ValueError(f"unknown package kind {kind!r}")
+
+
+def packaged_kind(platform=None):
+    """How this packaged program came: 'zip' (Windows), 'dmg' (macOS), 'deb' or 'rpm' (Linux),
+    or None (a Python copy, or a packaged program that was not built for a release)."""
+    if not FROZEN:
+        return None
+    platform = platform or sys.platform
+    if platform.startswith("win"):
+        return "zip"
+    if platform == "darwin":
+        return "dmg" if mac_app_bundle() else None
+    try:
+        with open(os.path.join(os.path.dirname(os.path.realpath(sys.executable)), PACKAGE_FORMAT_FILE),
+                  encoding="utf-8") as f:
+            kind = f.read().strip()
+        return kind if kind in ("deb", "rpm") else None
+    except OSError:
+        return None
+
+
+def mac_app_bundle():
+    """The .app bundle this packaged program runs from on macOS, or None."""
+    app = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(sys.executable))))
+    return app if app.endswith(".app") else None
+
+
+def find_latest_release():
+    """The newest GitHub release: {'version', 'tag', 'page' (its web page), 'assets'
+    ({file name: (download URL, size)})}. Raises UpdateError if it cannot be found."""
+    url = f"{GITHUB_API}/repos/{UPDATE_REPOSITORY}/releases/latest"
+    try:
+        release = json.loads(_download(url))
+    except urllib.error.HTTPError as err:
+        if err.code == 404:
+            raise UpdateError(f"No release of {APP_NAME} is published on GitHub yet.") from None
+        raise UpdateError(f"GitHub did not answer the question for the newest release (HTTP error {err.code}).") from None
+    except OSError as err:
+        raise UpdateError(_connection_problem(err)) from None
+    except ValueError:
+        raise UpdateError("GitHub gave an answer that could not be read; try again later.") from None
+    tag = release.get("tag_name") if isinstance(release, dict) else None
+    version = (tag or "").lstrip("vV")
+    if not tag or _version_tuple(version) == (0,):
+        raise UpdateError(f"The newest release on GitHub has no version number ({tag!r}).")
+    assets = {a["name"]: (a["browser_download_url"], int(a.get("size") or 0))
+              for a in release.get("assets") or [] if a.get("name") and a.get("browser_download_url")}
+    return {"version": version, "tag": tag, "page": release.get("html_url") or RELEASES_PAGE, "assets": assets}
+
+
+def find_update():
+    """The newest version for this copy: a release for a packaged copy, the main branch for a Python copy."""
+    return find_latest_release() if FROZEN else find_latest_version()
+
+
+def download_file(url, path, progress=None, size=0):
+    """Download url into the file path (via path + '.part'); progress(done, total) is called
+    along the way (from this thread). Raises UpdateError."""
+    request = urllib.request.Request(url, headers={"User-Agent": f"{APP_SLUG}/{APP_VERSION}"})
+    part = path + ".part"
+    try:
+        with urllib.request.urlopen(request, timeout=UPDATE_TIMEOUT) as response, open(part, "wb") as f:
+            total = int(response.headers.get("Content-Length") or size or 0)
+            done = 0
+            while True:
+                chunk = response.read(1 << 20)
+                if not chunk:
+                    break
+                done += len(chunk)
+                if done > MAX_PACKAGE:
+                    raise UpdateError(f"{url} is unexpectedly large; it was not used.")
+                f.write(chunk)
+                if progress:
+                    progress(done, total)
+        if total and done != total:
+            raise UpdateError(f"The download of {os.path.basename(path)} was cut off ({done} of {total} bytes).")
+        os.replace(part, path)
+    except urllib.error.HTTPError as err:
+        raise UpdateError(f"{url} could not be downloaded (HTTP error {err.code}).") from None
+    except OSError as err:
+        raise UpdateError(_connection_problem(err) if isinstance(err, urllib.error.URLError)
+                          else f"The download of {os.path.basename(path)} failed: {err}") from None
+    finally:
+        if os.path.exists(part):
+            try:
+                os.remove(part)
+            except OSError:
+                pass
+
+
+def download_folder():
+    """Where a downloaded package is kept: the Downloads folder, or the home folder."""
+    downloads = os.path.expanduser("~/Downloads")
+    return downloads if os.path.isdir(downloads) and os.access(downloads, os.W_OK) else os.path.expanduser("~")
+
+
+def _restart_args(files):
+    return [os.path.realpath(sys.executable)] + [f for f in files if f]
+
+
+def prepare_windows_swap(zip_path, files=(), relaunch=True, exe=None, pid=None):
+    """Unpack the new Windows package next to this program's folder and write the script that
+    swaps the folders once this program (or the process pid) has exited, and starts the new one
+    if relaunch. exe: the program to replace (this one). Returns the command that runs the
+    script; raises UpdateError if this is not possible."""
+    exe = os.path.realpath(exe or sys.executable)
+    app_dir = os.path.dirname(exe)
+    parent = os.path.dirname(app_dir)
+    if not (os.access(parent, os.W_OK) and os.access(app_dir, os.W_OK)):
+        raise UpdateError(f"{app_dir} cannot be changed by your user account.")
+    stage = app_dir + ".update"
+    shutil.rmtree(stage, ignore_errors=True)
+    try:
+        with zipfile.ZipFile(zip_path) as z:
+            for member in z.namelist():  # every file must stay inside the folder
+                target = os.path.realpath(os.path.join(stage, member))
+                if not target.startswith(os.path.realpath(stage) + os.sep):
+                    raise UpdateError(f"{os.path.basename(zip_path)} holds an unexpected file: {member}")
+            z.extractall(stage)
+    except (OSError, ValueError, zipfile.BadZipFile) as err:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise UpdateError(f"{os.path.basename(zip_path)} could not be unpacked: {err}") from None
+    new_dir = os.path.join(stage, APP_NAME)
+    exe_name = os.path.basename(exe)
+    if not os.path.isfile(os.path.join(new_dir, exe_name)):
+        shutil.rmtree(stage, ignore_errors=True)
+        raise UpdateError(f"{os.path.basename(zip_path)} does not hold {APP_NAME}\\{exe_name}.")
+
+    def ps(text):  # a PowerShell string literal
+        return "'" + str(text).replace("'", "''") + "'"
+
+    args = " ".join('"' + f.replace('"', '') + '"' for f in files if f)
+    start = (f"Start-Process -FilePath (Join-Path $app {ps(exe_name)})"
+             + (f" -ArgumentList {ps(args)}" if args else ""))
+    script = os.path.join(stage, "swap.ps1")
+    with open(script, "w", encoding="utf-8-sig") as f:
+        f.write(f"""# Written by {APP_NAME} {APP_VERSION}: puts the new version in place after the program has exited
+$ErrorActionPreference = 'Stop'
+$app = {ps(app_dir)}
+$new = {ps(new_dir)}
+$stage = {ps(stage)}
+$old = $app + '.old'
+$env:PYINSTALLER_RESET_ENVIRONMENT = '1'
+try {{ Wait-Process -Id {pid or os.getpid()} }} catch {{ }}  # also when the program is closed hours later
+if (Test-Path -LiteralPath $old) {{ Remove-Item -LiteralPath $old -Recurse -Force -ErrorAction SilentlyContinue }}
+$moved = $false
+for ($i = 0; $i -lt 60 -and -not $moved; $i++) {{
+    try {{ Rename-Item -LiteralPath $app -NewName (Split-Path $old -Leaf); $moved = $true }}
+    catch {{ Start-Sleep -Milliseconds 500 }}
+}}
+if ($moved) {{
+    try {{ Move-Item -LiteralPath $new -Destination $app }}
+    catch {{ Rename-Item -LiteralPath $old -NewName (Split-Path $app -Leaf); $moved = $false }}
+}}
+{start if relaunch else "# not restarted: the new version runs at the next start"}
+if ($moved) {{ Remove-Item -LiteralPath $old -Recurse -Force -ErrorAction SilentlyContinue }}
+Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+""")
+    return ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", script]
+
+
+def prepare_mac_swap(dmg_path, files=(), relaunch=True, app=None, pid=None):
+    """Copy the new FSP Viewer.app out of the disk image next to this one and write the script
+    that swaps the bundles once this program (or the process pid) has exited, and opens the new
+    one if relaunch. app: the bundle to replace (this one). Returns the command that runs the
+    script; raises UpdateError if this is not possible."""
+    app = app or mac_app_bundle()
+    if app is None:
+        raise UpdateError(f"{APP_NAME} does not run from an application bundle.")
+    parent = os.path.dirname(app)
+    if "/AppTranslocation/" in app or not (os.access(parent, os.W_OK) and os.access(app, os.W_OK)):
+        raise UpdateError(f"{app} cannot be replaced from here (move {APP_NAME} into the Applications "
+                          "folder first, or the folder needs administrator rights).")
+    stage = tempfile.mkdtemp(prefix=f".{APP_SLUG}-update-", dir=parent)
+    mount = tempfile.mkdtemp(prefix=f"{APP_SLUG}-dmg-")
+    try:
+        subprocess.run(["hdiutil", "attach", "-nobrowse", "-readonly", "-noautoopen", "-quiet",
+                        "-mountpoint", mount, dmg_path], check=True, capture_output=True, timeout=300)
+        try:
+            source = os.path.join(mount, APP_NAME + ".app")
+            if not os.path.isdir(source):
+                raise UpdateError(f"{os.path.basename(dmg_path)} does not hold {APP_NAME}.app.")
+            subprocess.run(["ditto", source, os.path.join(stage, APP_NAME + ".app")],
+                           check=True, capture_output=True, timeout=600)
+        finally:
+            subprocess.run(["hdiutil", "detach", mount, "-force", "-quiet"], capture_output=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as err:
+        shutil.rmtree(stage, ignore_errors=True)
+        detail = getattr(err, "stderr", b"") or b""
+        raise UpdateError(f"{os.path.basename(dmg_path)} could not be opened: "
+                          f"{detail.decode(errors='replace').strip() or err}") from None
+    except UpdateError:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+    finally:
+        try:
+            os.rmdir(mount)
+        except OSError:
+            pass
+    q = shlex.quote
+    open_cmd = "open " + q(app) + (" --args " + " ".join(q(f) for f in files if f) if any(files) else "")
+    script = os.path.join(stage, "swap.sh")
+    with open(script, "w", encoding="utf-8") as f:
+        f.write(f"""#!/bin/sh
+# Written by {APP_NAME} {APP_VERSION}: puts the new version in place after the program has exited
+while kill -0 {pid or os.getpid()} 2>/dev/null; do sleep 0.3; done
+if mv {q(app)} {q(os.path.join(stage, "old.app"))}; then
+    if mv {q(os.path.join(stage, APP_NAME + ".app"))} {q(app)}; then
+        /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f {q(app)} >/dev/null 2>&1
+    else
+        mv {q(os.path.join(stage, "old.app"))} {q(app)}
+    fi
+fi
+{open_cmd if relaunch else ": the new version runs at the next start"}
+rm -rf {q(stage)}
+""")
+    return ["/bin/sh", script]
+
+
+def linux_install_command(kind, path):
+    """The command (without pkexec / sudo) that installs a downloaded .deb or .rpm package."""
+    def which(name):
+        return shutil.which(name) or shutil.which(name, path="/usr/sbin:/usr/bin:/sbin:/bin")
+    if kind == "deb":
+        if which("apt-get"):
+            return [which("apt-get"), "install", "-y", "--allow-downgrades", path]
+        return [which("dpkg") or "dpkg", "-i", path]
+    if which("dnf"):
+        return [which("dnf"), "install", "-y", "--nogpgcheck", path]
+    if which("zypper"):
+        return [which("zypper"), "--non-interactive", "install", "--allow-unsigned-rpm", path]
+    if which("yum"):
+        return [which("yum"), "install", "-y", "--nogpgcheck", path]
+    return [which("rpm") or "rpm", "-U", "--replacepkgs", path]
+
+
+def install_linux_package(kind, path):
+    """Install a downloaded .deb / .rpm with administrator rights (pkexec asks for the password
+    in a window). Returns (success, message)."""
+    cmd = linux_install_command(kind, path)
+    manual = "sudo " + " ".join(shlex.quote(c if i else os.path.basename(c)) for i, c in enumerate(cmd))
+    if os.geteuid() != 0:
+        pkexec = shutil.which("pkexec")
+        if not pkexec or not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+            return False, ("Installing the package needs administrator rights. In a terminal, run\n"
+                           f"    {manual}")
+        cmd = [pkexec] + cmd
+    try:
+        result = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, timeout=1800)
+    except (OSError, subprocess.SubprocessError) as err:
+        return False, f"The package could not be installed ({err}). In a terminal, run\n    {manual}"
+    if result.returncode == 0:
+        return True, f"{os.path.basename(path)} is installed."
+    if result.returncode in (126, 127) and cmd[0].endswith("pkexec"):
+        why = "the password was not given"
+    else:
+        lines = (result.stderr or result.stdout).decode(errors="replace").strip().splitlines()
+        why = lines[-1] if lines else f"exit code {result.returncode}"
+    return False, f"The package was not installed ({why}). In a terminal, run\n    {manual}"
+
+
+def start_detached(cmd):
+    """Run cmd in the background so that it outlives this program."""
+    env = dict(os.environ, **RELAUNCH_ENV)
+    if sys.platform.startswith("win"):
+        flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        subprocess.Popen(cmd, creationflags=flags, env=env, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
+    else:
+        subprocess.Popen(cmd, start_new_session=True, env=env, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
 
 
 class AppDialog(tk.Toplevel):
@@ -5279,7 +5587,7 @@ class FSPGuiApp:
 
         def look():  # runs in a background thread: no Tk calls here
             try:
-                result["latest"] = find_latest_version()
+                result["latest"] = find_update()
             except Exception as err:  # offline, GitHub unreachable, ...: try again at the next start
                 result["error"] = err
 
@@ -5316,6 +5624,14 @@ class FSPGuiApp:
 
     def report_update(self, latest, platform=None):
         """Answer Help > Check for Updates: offer the new version, or say that there is none."""
+        if FROZEN:
+            remember_update_check()
+            if is_newer(latest["version"], APP_VERSION):
+                self.offer_package_update(latest, asked=True)
+            else:
+                self.message("Check for Updates", f"{APP_NAME} {APP_VERSION} is up to date.\n\n"
+                                                  f"The newest release on GitHub is {latest['version']}.")
+            return
         installed = installed_copy(platform)
         if installed is not None and is_newer(latest["version"], installed["version"]):
             self.offer_update(latest, platform, asked=True)
@@ -5334,9 +5650,12 @@ class FSPGuiApp:
         asked: the user chose Check for Updates, so a version skipped before is offered too.
         """
         remember_update_check()
+        if FROZEN:
+            self.offer_package_update(latest, asked)
+            return
         config = load_config()
         installed = installed_copy(platform)
-        if installed is None:  # a packaged application, or a copy that is not installed
+        if installed is None:  # a copy that is not installed
             self.offer_download(latest, asked)
             return
         if (not is_newer(latest["version"], installed["version"])
@@ -5374,16 +5693,19 @@ class FSPGuiApp:
                         [("restart", "Restart now"), ("later", "Later")]) == "restart":
             self.restart(installed["script"])
 
-    def offer_download(self, latest, asked=False):
-        """A newer version for a copy that cannot update itself (the Windows application, or a
-        copy that is not installed): offer the download page of the newest GitHub release."""
+    def offer_download(self, latest, asked=False, why=""):
+        """A newer version for a copy that cannot update itself (a Python copy that is not
+        installed, or a packaged copy whose package is not in the release): offer the download
+        page (of the release for a packaged copy, of the project for a Python copy)."""
         config = load_config()
         if not is_newer(latest["version"], APP_VERSION) or (
                 not asked and config.get("skipped_version") == latest["version"]):
             return
-        if FROZEN and sys.platform.startswith("win"):
-            how = (f"Download FSP-Viewer-{latest['version']}-windows.zip from the release page, unpack it "
-                   f"and start '{APP_NAME}.exe' in the new folder (the old folder can then be deleted).")
+        kind = packaged_kind()
+        if FROZEN:
+            how = ((why + "\n\n") if why else "") + (
+                f"Download {release_asset_name(latest['version'], kind)} from the release page and install it."
+                if kind else "Download the package for your system from the release page.")
         elif install_target(False) is not None:
             how = (f"Download it from GitHub, or install {APP_NAME} (Help > Install), "
                    "which then updates itself.")
@@ -5402,22 +5724,167 @@ class FSPGuiApp:
             config["skipped_version"] = latest["version"]
         save_config(config)
         if choice == "open":
-            webbrowser.open(RELEASES_PAGE)
+            webbrowser.open(latest.get("page") or (RELEASES_PAGE if FROZEN else APP_WEBSITE))
 
-    def restart(self, script):
-        """Close the window and run `script` (the updated program) in place of this process,
-        with the files that are open now."""
-        args = [sys.executable, script]
-        if self.model is not None:
-            args.append(self.model.fsp_path)
-            if self.model.h5_path:
-                args.append(self.model.h5_path)
+    def offer_package_update(self, latest, asked=False):
+        """A packaged copy (Windows .zip, macOS .dmg, Linux .deb / .rpm): offer the newer release,
+        download the package made for this system and put it in place."""
+        config = load_config()
+        if not is_newer(latest["version"], APP_VERSION) or (
+                not asked and config.get("skipped_version") == latest["version"]):
+            return
+        kind = packaged_kind()
+        asset = release_asset_name(latest["version"], kind) if kind else None
+        if asset is None or asset not in latest["assets"]:
+            self.offer_download(latest, asked, why=(
+                f"The release has no {asset} (yet)." if asset else
+                "This copy was not installed from a release package, so it cannot update itself."))
+            return
+        url, size = latest["assets"][asset]
+        how = {"zip": "The program closes, its folder is replaced by the new version, and it starts again.",
+               "dmg": f"The program closes, {APP_NAME}.app is replaced by the new version, and it starts again.",
+               }.get(kind, "The package is installed with the package manager, which asks for your password.")
+        choice = AppDialog(
+            self.root, f"Update {APP_NAME}?",
+            f"A new version of {APP_NAME} is available.\n\n"
+            f"    This version:  {APP_VERSION}\n"
+            f"    New version:  {latest['version']}  ({asset}, {size / 1e6:.0f} MB)\n\n"
+            f"Download and install it now? {how}",
+            [("update", "Update now"), ("later", "Not now"), ("skip", "Skip this version")],
+            note=f"From the release {latest['tag']} on github.com/{UPDATE_REPOSITORY}. "
+                 "Help > Check for Updates looks for a new version at any time.",
+            icon=self.dialog_icon(), checkbox=self._weekly_checkbox(config.get("check_updates", True))).show()
+        config = load_config()
+        if self.weekly is not None and choice is not None:
+            config["check_updates"] = bool(self.weekly.get())
+        if choice == "skip":
+            config["skipped_version"] = latest["version"]
+        save_config(config)
+        if choice == "update":
+            self._download_package(latest, kind, asset, url, size)
+
+    def _download_package(self, latest, kind, asset, url, size):
+        """Download (and for zip / dmg unpack) the package in a background thread, with the progress
+        in the status bar; then finish the update in _finish_package_update."""
+        if getattr(self, "_updating", False):
+            return
+        self._updating = True
+        folder = download_folder() if kind in ("deb", "rpm") else tempfile.mkdtemp(prefix=f"{APP_SLUG}-")
+        path = os.path.join(folder, asset)
+        state = {"done": 0, "total": size}
+
+        def progress(done, total):
+            state["done"], state["total"] = done, total
+
+        def work():  # background thread: no Tk calls here
+            try:
+                download_file(url, path, progress, size)
+                if kind == "zip":
+                    state["prepare"] = prepare_windows_swap
+                elif kind == "dmg":
+                    state["prepare"] = prepare_mac_swap
+                state["ok"] = True
+            except Exception as err:
+                state["error"] = err
+
+        gc.collect()  # see check_for_update: Tk objects must not be freed in the thread
+        thread = threading.Thread(target=work, daemon=True)
+        thread.start()
+        self.root.configure(cursor="watch")
+
+        def wait():
+            if thread.is_alive():
+                done, total = state["done"], state["total"]
+                share = f"{100 * done / total:.0f} %, " if total else ""
+                self.set_status(f"\u23f3 Downloading {asset}: {share}{done / 1e6:.0f}"
+                                + (f" of {total / 1e6:.0f}" if total else "") + " MB\u2026", "busy")
+                self.root.after(250, wait)
+                return
+            self.root.configure(cursor="")
+            self._updating = False
+            if "error" in state:
+                self.set_status(f"\u2717 The update to {latest['version']} failed", "error")
+                if self.message(f"Update {APP_NAME}", f"The update was not installed.\n\n{state['error']}",
+                                [("open", "Open Download Page"), ("ok", "OK")]) == "open":
+                    webbrowser.open(latest.get("page") or RELEASES_PAGE)
+                return
+            self.set_status(f"\u2713 Downloaded {asset}", "ok")
+            self._finish_package_update(latest, kind, path, state.get("prepare"))
+
+        self.root.after(250, wait)
+
+    def _open_files(self):
+        """The files that are open now (to be opened again after a restart)."""
+        if self.model is None:
+            return []
+        return [self.model.fsp_path] + ([self.model.h5_path] if self.model.h5_path else [])
+
+    def _finish_package_update(self, latest, kind, path, prepare):
+        version = latest["version"]
+        if kind in ("deb", "rpm"):
+            with self.busy(f"Installing {os.path.basename(path)}"):
+                ok, message = install_linux_package(kind, path)
+            if not ok:
+                self.set_status(f"\u2717 {APP_NAME} {version} was not installed", "error")
+                self.message(f"Update {APP_NAME}", f"{message}\n\nThe package is kept in {os.path.dirname(path)}.")
+                return
+            self.set_status(f"\u2713 {APP_NAME} {version} is installed", "ok")
+            if self.message(f"Restart {APP_NAME}?",
+                            f"{APP_NAME} {version} is installed.\n\nRestart now to use it? "
+                            "The file that is open now is opened again.",
+                            [("restart", "Restart now"), ("later", "Later")]) == "restart":
+                self.restart()
+            return
+        choice = self.message(
+            f"Restart {APP_NAME}?",
+            f"{APP_NAME} {version} is downloaded.\n\n{APP_NAME} must close to put the new version in "
+            "place. Restart now? The file that is open now is opened again.",
+            [("restart", "Restart now"), ("exit", "When I quit"), ("cancel", "Cancel")],
+            note="When I quit: the new version is put in place when you close the program, and runs at the next start.")
+        if choice not in ("restart", "exit"):
+            return
+        try:
+            with self.busy("Preparing the update"):
+                cmd = prepare(path, self._open_files(), relaunch=choice == "restart")
+                start_detached(cmd)
+            shutil.rmtree(os.path.dirname(path), ignore_errors=True)  # the download (unpacked by now)
+        except Exception as err:
+            reveal = kind == "dmg"
+            text = f"The update could not be prepared.\n\n{err}"
+            if reveal:
+                text += f"\n\nThe disk image is opened in Finder: drag {APP_NAME} to Applications to install it."
+            self.message(f"Update {APP_NAME}", text)
+            if reveal:
+                subprocess.run(["open", path], check=False)
+            else:
+                webbrowser.open(latest.get("page") or RELEASES_PAGE)
+            return
+        if choice == "restart":
+            self.root.destroy()  # the script waits for this process to end, then starts the new version
+        else:
+            self.set_status(f"\u2713 {APP_NAME} {version} is put in place when you quit", "ok")
+
+    def restart(self, script=None):
+        """Close the window and run `script` (the updated program; a packaged program runs itself
+        again) in place of this process, with the files that are open now."""
+        if FROZEN:
+            args = _restart_args(self._open_files())
+            self.root.destroy()
+            os.execve(args[0], args, dict(os.environ, **RELAUNCH_ENV))
+        args = [sys.executable, script] + self._open_files()
         self.root.destroy()
         os.execv(sys.executable, args)
 
     def show_about(self):
-        installed = installed_copy()
-        where = (f"Installed version: {installed['version']}" if installed else "Not installed on this computer")
+        kind = packaged_kind()
+        if FROZEN:
+            where = {"zip": "Windows application", "dmg": "macOS application",
+                     "deb": "Linux package (.deb)", "rpm": "Linux package (.rpm)"}.get(kind, "Packaged application")
+            where += "; updates from the GitHub releases"
+        else:
+            installed = installed_copy()
+            where = (f"Installed version: {installed['version']}" if installed else "Not installed on this computer")
+            where += "; updates from the main branch on GitHub"
         choice = self.message(
             f"About {APP_NAME}",
             f"{APP_NAME} {APP_VERSION}\n{APP_DESCRIPTION}\n\n"
@@ -5512,6 +5979,10 @@ def main(argv=None):
     if args.self_test:
         return self_test(args.self_test, os.path.abspath(args.fsp) if args.fsp else None)  # macOS may add an argument such as -psn_0_123 from Finder
     if args.install or args.install_systemwide or args.uninstall or args.update:
+        if FROZEN:
+            print(f"This is the packaged {APP_NAME}: it is installed from its package and updates itself "
+                  "(Help > Check for Updates).")
+            return 1
         if args.update:
             ok, message = update_installed_app()
         elif args.uninstall:
