@@ -34,6 +34,7 @@ Usage:
 
 import ast
 import collections
+import contextlib
 import gc
 import json
 import math
@@ -83,7 +84,7 @@ os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 # Application parameters - edit these to customise the app
 # ======================================================================
 APP_NAME = "FSP Viewer"         # Window title, name of the installed application and (macOS) menu-bar name
-APP_VERSION = "0.2.2"           # See the version history in README.md
+APP_VERSION = "0.2.3"           # See the version history in README.md
 APP_DESCRIPTION = "Lumerical FSP 3D Viewer & Results Analyzer"
 APP_SLUG = "fsp_viewer"         # Folder and file names of the installation
 APP_CLASS = "Fsp_viewer"        # Window class (Linux: connects the windows to the menu entry)
@@ -614,6 +615,7 @@ class FSPModelData:
 
         # Without an explicit .h5 file, look for the one that belongs to the project
         self.h5_skipped = None   # a field file that was found but not opened, for the status line
+        self.h5_missing = h5_path if h5_path and not os.path.isfile(h5_path) else None  # given, not found
         if h5_path and os.path.isfile(h5_path):
             self.load_h5(h5_path)
         else:
@@ -3714,6 +3716,7 @@ class FSPGuiApp:
         self.popout_win: tk.Toplevel | None = None
         self.popout_fig: Figure | None = None
         self.popout_canvas: FigureCanvasTkAgg | None = None
+        self._busy_depth = 0
 
         self._build_ui()
         self._build_menu()
@@ -3814,15 +3817,6 @@ class FSPGuiApp:
         self.save_geometry_menu.add_command(label="Python script for gdsfactory (.py)…",
                                             command=lambda: self.save_geometry("py"))
 
-        self.file_lbl = tk.Label(
-            toolbar,
-            text="No file loaded",
-            font=(FONT_MONO, 9),
-            bg=T["bar_bg"],
-            fg=T["text_muted"],
-        )
-        self.file_lbl.pack(side=tk.LEFT, padx=(0, 12))
-
         # Right side controls: Port selection dropdown + Results selection dropdown + Plot + Export Data
         FlatButton(
             toolbar,
@@ -3902,6 +3896,22 @@ class FSPGuiApp:
         #   Left Side  : 4-View Visualization Field (top) + Model Parameters Editor (bottom)
         #   Right Side : Fifth Larger Plot Window (docked + pop-out option)
         # ==================================================================
+        # ==================================================================
+        # Status Bar (bottom): what the program is doing (left) and the state of the .h5 file (right)
+        # ==================================================================
+        statusbar = tk.Frame(self.root, bg=T["bar_bg"])
+        statusbar.pack(fill=tk.X, side=tk.BOTTOM)
+        tk.Frame(self.root, bg=T["border"], height=1).pack(fill=tk.X, side=tk.BOTTOM)
+        self.status_info_lbl = tk.Label(
+            statusbar, text="", font=(FONT_UI, 9), bg=T["bar_bg"], fg=T["text_muted"], anchor="e"
+        )
+        self.status_info_lbl.pack(side=tk.RIGHT, padx=(12, 10), pady=2)
+        self.status_lbl = tk.Label(
+            statusbar, text="Ready: open an .fsp file", font=(FONT_UI, 9), bg=T["bar_bg"],
+            fg=T["text_muted"], anchor="w"
+        )
+        self.status_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 0), pady=2)
+
         self.main_paned = tk.PanedWindow(
             self.root, orient=tk.HORIZONTAL, bg=T["app_bg"], sashwidth=6, bd=0, opaqueresize=True
         )
@@ -3968,15 +3978,6 @@ class FSPGuiApp:
             fg=T["text"],
         ).pack(side=tk.LEFT, padx=(10, 8), pady=5)
 
-        self.status_lbl = tk.Label(
-            plot_header,
-            text="",
-            font=(FONT_UI, 9),
-            bg=T["panel_bg"],
-            fg=T["success"],
-        )
-        self.status_lbl.pack(side=tk.LEFT, padx=6)
-
         FlatButton(
             plot_header,
             "↗ Separate Window",
@@ -4017,6 +4018,74 @@ class FSPGuiApp:
         self._draw_empty_plot()
 
     # ==================================================================
+    # Status Bar
+    # ==================================================================
+    STATUS_COLORS = {"info": "text_muted", "busy": "warning", "ok": "success", "warn": "warning", "error": "danger"}
+
+    def set_status(self, text, kind="info"):
+        """Show a message in the status bar; kind: info, busy, ok, warn or error."""
+        self.status_lbl.config(text=text, fg=THEME[self.STATUS_COLORS[kind]])
+
+    @contextlib.contextmanager
+    def busy(self, text, done=None):
+        """Say in the status bar what is being done while the block runs, with a busy cursor.
+
+        Afterwards the status bar shows done (\u2713 done, with the time taken when it was noticeable),
+        or "Ready"; when the block fails, what failed. A busy block inside another one shows its
+        text while it runs, then gives the status bar back to the outer one."""
+        outer = self._busy_depth == 0
+        before = (self.status_lbl.cget("text"), self.status_lbl.cget("fg"))
+        self._busy_depth += 1
+        self.set_status(f"\u23f3 {text}\u2026", "busy")
+        try:
+            if outer:
+                self.root.configure(cursor="watch")
+                self.root.update()  # macOS draws the status bar only when the event loop runs
+            else:
+                self.status_lbl.update_idletasks()
+        except tk.TclError:
+            pass
+        t0 = time.perf_counter()
+        try:
+            yield
+        except Exception as exc:
+            self.set_status(f"\u2717 {text} failed: {str(exc).splitlines()[0] if str(exc) else type(exc).__name__}",
+                            "error")
+            raise
+        else:
+            if not outer:
+                self.status_lbl.config(text=before[0], fg=before[1])
+            elif done:
+                dt = time.perf_counter() - t0
+                self.set_status(f"\u2713 {done}" + (f" ({dt:.1f} s)" if dt >= 0.1 else ""), "ok")
+            else:
+                self.set_status("Ready")
+        finally:
+            self._busy_depth -= 1
+            if outer:
+                try:
+                    self.root.configure(cursor="")
+                except tk.TclError:
+                    pass
+
+    def _update_h5_status(self):
+        """The right side of the status bar: which .h5 field file is open, or why there is none."""
+        m = self.model
+        if m is None:
+            text, kind = "", "info"
+        elif m.h5_path:
+            text, kind = f"\u2713 .h5 field file: {os.path.basename(m.h5_path)}", "ok"
+        elif h5py is None:
+            text, kind = "\u26a0 h5py is not installed: .h5 field files cannot be read", "warn"
+        elif m.h5_missing:
+            text, kind = f"\u26a0 .h5 file not found: {os.path.basename(m.h5_missing)}", "warn"
+        elif m.h5_skipped:
+            text, kind = f"\u26a0 {os.path.basename(m.h5_skipped)} not opened: the project holds no results", "warn"
+        else:
+            text, kind = "\u26a0 No .h5 field file found", "warn"
+        self.status_info_lbl.config(text=text, fg=THEME[self.STATUS_COLORS[kind]])
+
+    # ==================================================================
     # File Loading & Port Selection
     # ==================================================================
     def browse_fsp(self):
@@ -4038,30 +4107,38 @@ class FSPGuiApp:
             filetypes=[("HDF5 files", "*.h5 *.hdf5"), ("All files", "*.*")],
         )
         if path:
-            self.model.load_h5(path)
+            if h5py is None:
+                messagebox.showerror("Cannot Open .h5 File", "The h5py package is not installed: .h5 files cannot be read.")
+                return
+            try:
+                with self.busy(f"Opening {os.path.basename(path)}"):
+                    self.model.load_h5(path)
+            except Exception as exc:
+                messagebox.showerror("Error Opening .h5 File", f"Could not read {path}:\n\n{exc}")
+                return
             self._refresh_after_load()
 
     def open_fsp_file(self, fsp_path, h5_path=None):
+        t0 = time.perf_counter()
         try:
-            self.model = FSPModelData(fsp_path, h5_path)
+            with self.busy(f"Opening {os.path.basename(fsp_path)}"):
+                model = FSPModelData(fsp_path, h5_path)
         except Exception as exc:
             messagebox.showerror("Error Opening .fsp File", f"Could not read {fsp_path}:\n\n{exc}")
             return
-        self._refresh_after_load()
+        self.model = model
+        self._refresh_after_load(t0)
 
-    def _refresh_after_load(self):
+    def _refresh_after_load(self, t0=None):
         if self.model is None:
             return
-        fsp_name = os.path.basename(self.model.fsp_path)
-        h5_name = os.path.basename(self.model.h5_path) if self.model.h5_path else "no .h5"
-        if not self.model.h5_path and self.model.h5_skipped:
-            h5_name = (f"no .h5: {os.path.basename(self.model.h5_skipped)} was not opened, "
-                       "the project holds no results")
-        self.file_lbl.config(
-            text=f"{fsp_name}  ({h5_name})",
-            fg=THEME["text"],
-        )
-        self.root.title(f"{APP_NAME} — {fsp_name}")
+        t0 = time.perf_counter() if t0 is None else t0
+        # the open files are named only in the window title: long names in the toolbar pushed
+        # the port and result selectors out of the window
+        title = os.path.basename(self.model.fsp_path)
+        if self.model.h5_path:
+            title += f" ({os.path.basename(self.model.h5_path)})"
+        self.root.title(f"{APP_NAME} — {title}")
 
         # Populate Port dropdown
         port_choices = ["All Ports"] + [pt["name"] for pt in self.model.ports]
@@ -4080,16 +4157,24 @@ class FSPGuiApp:
         self.cmb_lam["values"] = lam_choices
         self.lam_var.set(lam_choices[0])
 
+        self._update_h5_status()
+
         # Update 4 views and Parameter Editor
         sel_port = self.port_var.get()
-        self.view_xy.set_model(self.model, sel_port)
-        self.view_xz.set_model(self.model, sel_port)
-        self.view_yz.set_model(self.model, sel_port)
-        self.view_3d.set_model(self.model, sel_port)
-        self.param_editor.set_model(self.model)
+        with self.busy("Drawing the model views"):
+            self.view_xy.set_model(self.model, sel_port)
+            self.view_xz.set_model(self.model, sel_port)
+            self.view_yz.set_model(self.model, sel_port)
+            self.view_3d.set_model(self.model, sel_port)
+            self.param_editor.set_model(self.model)
 
         # Automatically plot initial result in the 5th window
-        self.plot_selected()
+        if not self.plot_selected():
+            return  # the status bar says why the plot failed
+        m = self.model
+        n_mon = len(m.mode_monitors) + sum(mm["has_data"] for mm in m.field_monitors)
+        self.set_status(f"\u2713 Loaded {os.path.basename(m.fsp_path)}: {len(m.structures)} structures, "
+                        f"{len(m.ports)} ports, {n_mon} monitors ({time.perf_counter() - t0:.1f} s)", "ok")
 
     def select_port(self, port_name):
         if port_name in self.cmb_port["values"]:
@@ -4104,10 +4189,11 @@ class FSPGuiApp:
                                                   "Power Spectrum at Selected Plane (P / P_source)", "S-Parameters from Power |S_i1|² (dB)",
                                                   "Top-View Layout & Taper Zoom (XY)"):
             self.result_var.set("Simulated Field |E|² in YZ Planes (ports & monitors)")
-        self.view_xy.set_selected_port(sel_port)
-        self.view_xz.set_selected_port(sel_port)
-        self.view_yz.set_selected_port(sel_port)
-        self.view_3d.set_selected_port(sel_port)
+        with self.busy(f"Showing {sel_port} in the model views"):
+            self.view_xy.set_selected_port(sel_port)
+            self.view_xz.set_selected_port(sel_port)
+            self.view_yz.set_selected_port(sel_port)
+            self.view_3d.set_selected_port(sel_port)
         self.plot_selected()
 
     def _selected_freq_index(self):
@@ -4157,7 +4243,7 @@ class FSPGuiApp:
         if self.popout_win is not None and self.popout_win.winfo_exists():
             self.popout_win.lift()
             self.popout_win.focus_force()
-            self._render_onto_figure(self.popout_fig)
+            self._render_with_status(self.popout_fig)
             self.popout_canvas.draw_idle()
             return
 
@@ -4197,19 +4283,29 @@ class FSPGuiApp:
         tb.update()
         tb.pack(side=tk.LEFT, fill=tk.X)
 
-        self._render_onto_figure(self.popout_fig)
+        self._render_with_status(self.popout_fig)
         self.popout_canvas.draw_idle()
 
     def plot_selected(self):
+        """Plot the selected result (also in the separate window); False if it could not be plotted."""
         if self.model is None:
             self._draw_empty_plot("Please open an .fsp file first.")
-            return
-        self.status_lbl.config(text="")
-        self._render_onto_figure(self.fig)
+            return False
+        ok = self._render_with_status(self.fig)
         self.mpl_canvas.draw_idle()
         if self.popout_win is not None and self.popout_win.winfo_exists():
             self._render_onto_figure(self.popout_fig)
             self.popout_canvas.draw_idle()
+        return ok
+
+    def _render_with_status(self, fig: Figure):
+        """Render the selected result onto fig, saying so in the status bar; False if it failed."""
+        res_kind = self.result_var.get()
+        with self.busy(f"Computing {res_kind}", done=f"Plotted {res_kind}"):
+            error = self._render_onto_figure(fig)
+        if error:
+            self.set_status(f"\u2717 Cannot plot {res_kind}: {error.splitlines()[0]}", "error")
+        return not error
 
     def _get_target_ports(self, max_all=4):
         """Returns list of port/monitor names to plot based on the Port dropdown."""
@@ -4234,6 +4330,7 @@ class FSPGuiApp:
         return [sel]
 
     def _render_onto_figure(self, fig: Figure):
+        """Draw the selected result onto fig; returns None, or the reason it could not be plotted."""
         fig.clear()
         res_kind = self.result_var.get()
         port_sel = self.port_var.get()
@@ -4286,6 +4383,8 @@ class FSPGuiApp:
             )
             ax.set_xticks([])
             ax.set_yticks([])
+            return str(exc) or type(exc).__name__
+        return None
 
     # ------------------------------------------------------------------
     # Individual Plot Implementations (matching fsp_plots.py + export data)
@@ -5099,6 +5198,7 @@ class FSPGuiApp:
             if interactive:
                 self._looking_for_update = False
                 self.root.configure(cursor="")
+                self.set_status("Ready")
             if "latest" in result:
                 (self.report_update if interactive else self.offer_update)(result["latest"], platform)
             elif interactive:
@@ -5113,6 +5213,7 @@ class FSPGuiApp:
             return None
         self._looking_for_update = True
         self.root.configure(cursor="watch")
+        self.set_status("\u23f3 Looking for a new version on GitHub\u2026", "busy")
         return self.check_for_update(platform, interactive=True)
 
     def report_update(self, latest, platform=None):
@@ -5263,7 +5364,8 @@ class FSPGuiApp:
         if not path.lower().endswith(".py" if kind == "py" else ".gds"):
             path += ".py" if kind == "py" else ".gds"
         try:
-            fsp_export.save(self.model.structures, path, self.model.fsp_path)
+            with self.busy(f"Saving geometry to {os.path.basename(path)}"):
+                fsp_export.save(self.model.structures, path, self.model.fsp_path)
         except (OSError, ValueError) as exc:
             messagebox.showerror("Error Saving Geometry", f"Could not save {path}:\n\n{exc}")
             return None
@@ -5272,7 +5374,7 @@ class FSPGuiApp:
         if kind == "py":
             n_poly = sum(fsp_export.decompose(sh["points"]) is None for sh in shapes)
             text += ", all from rectangles and tapers" if not n_poly else f", {n_poly} as polygons"
-        self.status_lbl.config(text=text + ")", fg=THEME["success"])
+        self.set_status(text + ")", "ok")
         return path
 
     # ==================================================================
@@ -5286,10 +5388,7 @@ class FSPGuiApp:
         self.root.clipboard_append(self.last_exported_tsv)
         self.root.update()
         n_lines = len(self.last_exported_tsv.splitlines())
-        self.status_lbl.config(
-            text=f"✓ Copied to clipboard: {self.last_exported_desc} ({n_lines} lines)",
-            fg=THEME["success"],
-        )
+        self.set_status(f"✓ Copied to clipboard: {self.last_exported_desc} ({n_lines} lines)", "ok")
 
 
 def main(argv=None):

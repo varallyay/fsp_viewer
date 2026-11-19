@@ -2,7 +2,7 @@
 
 <img src="icon.png" width="96" alt="FSP Viewer icon: a black square on a yellow background">
 
-**Version 0.2.2** — see [Version History](#version-history).
+**Version 0.2.3** — see [Version History](#version-history).
 
 View Ansys Lumerical FDTD project files (`.fsp`), plot their results and save their geometry as GDS **without a Lumerical license**, on macOS and Linux, and on Windows as a ready-to-run program that needs no Python (see [Windows application](#windows-application)).
 
@@ -89,6 +89,11 @@ An installed FSP Viewer looks for a new version on <https://github.com/varallyay
 | **Plot** | Draw the selected result |
 | **Export Data** | Copy the numbers of the current plot to the clipboard as a tab-separated table (for a spreadsheet) |
 
+The window title names the open project, and the `.h5` field file in brackets when one is open: `FSP Viewer — model.fsp (model_output.h5)`.
+
+### Status bar
+The thin bar at the bottom says what the program is doing — opening a file, drawing the views, computing a plot (⏳, with a busy cursor) — and afterwards what came of it: the project loaded (structures, ports, monitors, time taken), the plot drawn, a file saved, data copied, or why a plot could not be made. On the right it shows the `.h5` field file that is open, or why there is none (not found, found but not opened because the project holds no results, or `h5py` missing).
+
 ### Geometry views
 Four linked views of the model, with lengths in µm:
 
@@ -154,7 +159,7 @@ The parameters at the top of `fsp_gui.py`:
 | Parameter | Default | Meaning |
 | :--- | :--- | :--- |
 | `APP_NAME` | `"FSP Viewer"` | Window title and name of the installed application |
-| `APP_VERSION` | `"0.2.2"` | Version number; decides whether a copy on GitHub is newer |
+| `APP_VERSION` | `"0.2.3"` | Version number; decides whether a copy on GitHub is newer |
 | `APP_ICON_YELLOW`, `APP_ICON_BLACK` | `"#ffd700"`, `"#000000"` | Colours of the icon |
 | `APP_ICON_SQUARE` | `0.5` | Side of the black square, as a fraction of the yellow field |
 | `APP_ICON_MARGIN` | `0.1` | Transparent margin on each side, as a fraction of the icon size |
@@ -181,7 +186,7 @@ On Windows FSP Viewer also runs **without Python and without installing anything
 - The program looks for a new version once a week; it cannot replace itself, so it offers the download page of the new release. Unpack the new `.zip` and delete the old folder.
 - Messages and error reports go to `%USERPROFILE%\.fsp_viewer.log` (the program has no console window); settings to `%USERPROFILE%\.fsp_viewer.json`.
 
-**How it is built.** The GitHub Actions workflow `.github/workflows/windows.yml` runs `build_windows.py` on a Windows machine of GitHub whenever a version tag is pushed (`git tag v0.2.2 && git push origin v0.2.2`; the tag must match `APP_VERSION`), and attaches the `.zip` to that release; started by hand (*Actions > Windows build > Run workflow*) it only keeps the `.zip` as a download of the run. `build_windows.py` packs the program with PyInstaller, gives the `.exe` its icon and version information, starts the packed program in a self-test (every library present, the window opens) and makes the `.zip`. To build on a Windows PC yourself:
+**How it is built.** The GitHub Actions workflow `.github/workflows/windows.yml` runs `build_windows.py` on a Windows machine of GitHub whenever a version tag is pushed (`git tag v0.2.3 && git push origin v0.2.3`; the tag must match `APP_VERSION`), and attaches the `.zip` to that release; started by hand (*Actions > Windows build > Run workflow*) it only keeps the `.zip` as a download of the run. `build_windows.py` packs the program with PyInstaller, gives the `.exe` its icon and version information, starts the packed program in a self-test (every library present, the window opens) and makes the `.zip`. To build on a Windows PC yourself:
 
 ```bat
 python -m pip install -r requirements-windows.txt
@@ -257,6 +262,9 @@ Nodes tagged `1000` (structures and layer-builder internals) start with a partly
 ---
 
 ## Version History
+
+### 0.2.3 — 2026-11-19
+- **Status bar** at the bottom of the window: what is being done (opening, drawing, computing), its outcome and time, and the state of the `.h5` field file. The file names moved from the toolbar to the window title (long names pushed the Port and Result selectors out of the window).
 
 ### 0.2.2 — 2026-11-18
 - **Freeze with `.h5` field files fixed** (e.g. a burst-mode run, `model/model_output.h5`): every frequency of a field component is compressed together, so reading one frequency unpacked the whole component. A spectrum took minutes, and closing the frozen window ended in *Fatal Python error: PyEval_RestoreThread*. Now a component is read once and kept, and the power spectrum and S-parameters take about 0.5 s per plane.
