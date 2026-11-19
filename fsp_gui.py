@@ -84,7 +84,7 @@ os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 # Application parameters - edit these to customise the app
 # ======================================================================
 APP_NAME = "FSP Viewer"         # Window title, name of the installed application and (macOS) menu-bar name
-APP_VERSION = "0.2.3"           # See the version history in README.md
+APP_VERSION = "0.2.4"           # See the version history in README.md
 APP_DESCRIPTION = "Lumerical FSP 3D Viewer & Results Analyzer"
 APP_SLUG = "fsp_viewer"         # Folder and file names of the installation
 APP_CLASS = "Fsp_viewer"        # Window class (Linux: connects the windows to the menu entry)
@@ -1658,13 +1658,18 @@ class ModelOrthoCanvas2D(tk.Frame):
     Supports pointer pan (left-drag), scroll-wheel zoom, Y-exaggeration toggle, and Fit view.
     """
 
-    def __init__(self, parent, view_kind, title, u_label, v_label, on_port_clicked=None):
+    def __init__(self, parent, view_kind, title, u_label, v_label, on_port_clicked=None, on_info=None):
         super().__init__(parent, bg=THEME["panel_bg"], highlightthickness=1, highlightbackground=THEME["border"])
         self.view_kind = view_kind  # "xy", "xz", or "yz"
         self.title = title
         self.u_label = u_label
         self.v_label = v_label
         self.on_port_clicked = on_port_clicked
+        # on_info(view) is called when the pointer enters the view, or the view is zoomed, and
+        # on_info(None) when the pointer leaves it: the status bar shows the stretch of the axes
+        # (the header has room for the pointer position only)
+        self.on_info = on_info
+        self._hovered = False
 
         self.default_u_range = [-35.0, 230.0] if view_kind in ("xy", "xz") else [-12.0, 12.0]
         self.default_v_range = [-26.0, 26.0] if view_kind == "xy" else [-6.5, 6.5]
@@ -1689,17 +1694,6 @@ class ModelOrthoCanvas2D(tk.Frame):
             fg=THEME["text"],
             anchor="w",
         ).pack(side=tk.LEFT, padx=(10, 6), pady=4)
-
-        self.info_lbl = tk.Label(
-            header,
-            text="no model",
-            font=(FONT_UI, 9),
-            bg=THEME["btn_bg"],
-            fg=THEME["text_dim"],
-            padx=6,
-            pady=1,
-        )
-        self.info_lbl.pack(side=tk.LEFT, padx=(0, 6))
 
         self.coord_lbl = tk.Label(
             header,
@@ -1747,6 +1741,8 @@ class ModelOrthoCanvas2D(tk.Frame):
 
         self.canvas.bind("<Configure>", lambda e: self.redraw())
         self.canvas.bind("<Motion>", self._on_motion)
+        self.canvas.bind("<Enter>", self._on_enter)
+        self.canvas.bind("<Leave>", self._on_leave)
         self.canvas.bind("<ButtonPress-1>", self._on_left_down)
         self.canvas.bind("<B1-Motion>", self._on_left_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_left_up)
@@ -1856,6 +1852,21 @@ class ModelOrthoCanvas2D(tk.Frame):
     def _on_motion(self, event):
         u, v = self.px_to_uv(event.x, event.y)
         self.coord_lbl.config(text=f"{self.u_label}={u:.3g}, {self.v_label}={v:.3g} μm")
+        if not self._hovered:
+            self._on_enter()
+
+    def _on_enter(self, _event=None):
+        self._hovered = True
+        self._notify_info()
+
+    def _on_leave(self, _event=None):
+        self._hovered = False
+        self.coord_lbl.config(text="")
+        self._notify_info()
+
+    def _notify_info(self):
+        if self.on_info is not None:
+            self.on_info(self if self._hovered and self.model is not None else None)
 
     def _on_left_down(self, event):
         # Check if clicking near a port marker
@@ -1992,7 +2003,6 @@ class ModelOrthoCanvas2D(tk.Frame):
         )
 
         if self.model is None:
-            self.info_lbl.config(text="no file", fg=T["text_dim"])
             c.create_text(
                 (x0 + x1) / 2,
                 (y0 + y1) / 2,
@@ -2002,13 +2012,8 @@ class ModelOrthoCanvas2D(tk.Frame):
             )
             return
 
-        n_ports = len(self.model.port_planes())
-        self.info_lbl.config(
-            text=f"{len(self.model.structures)} layers · {n_ports} ports"
-                 + (f" · {n_fm} monitors" if (n_fm := sum(m['has_data'] for m in self.model.field_monitors)) else "")
-                 + f" · {self._aspect_text()}",
-            fg=T["port_yellow"],
-        )
+        if self._hovered:  # the stretch of the axes changes with zooming
+            self._notify_info()
 
         # 2. Draw structures (background slabs first, then patterned/core structures)
         # Among them the larger ones first: a shape inside another one (an active layer in its
@@ -3717,6 +3722,11 @@ class FSPGuiApp:
         self.popout_fig: Figure | None = None
         self.popout_canvas: FigureCanvasTkAgg | None = None
         self._busy_depth = 0
+        # colour map of the colour (surface) plots, and whether it runs the other way; remembered
+        config = load_config()
+        cmap = config.get("colormap", self.COLORMAP_DEFAULT)
+        self.cmap_var = tk.StringVar(value=cmap if cmap in self.colormap_choices() else self.COLORMAP_DEFAULT)
+        self.cmap_reverse_var = tk.BooleanVar(value=bool(config.get("colormap_reversed", False)))
 
         self._build_ui()
         self._build_menu()
@@ -3906,6 +3916,12 @@ class FSPGuiApp:
             statusbar, text="", font=(FONT_UI, 9), bg=T["bar_bg"], fg=T["text_muted"], anchor="e"
         )
         self.status_info_lbl.pack(side=tk.RIGHT, padx=(12, 10), pady=2)
+        # layers, ports and monitors of the model, and the stretch of the view under the pointer
+        # (shown in the headers of the views before, where it hid the pointer position)
+        self.status_model_lbl = tk.Label(
+            statusbar, text="", font=(FONT_UI, 9), bg=T["bar_bg"], fg=T["port_yellow"], anchor="e"
+        )
+        self.status_model_lbl.pack(side=tk.RIGHT, padx=(12, 0), pady=2)
         self.status_lbl = tk.Label(
             statusbar, text="Ready: open an .fsp file", font=(FONT_UI, 9), bg=T["bar_bg"],
             fg=T["text_muted"], anchor="w"
@@ -3936,16 +3952,19 @@ class FSPGuiApp:
         quad_frame.grid_columnconfigure(1, weight=1, uniform="qcol")
 
         self.view_xy = ModelOrthoCanvas2D(
-            quad_frame, "xy", "XY View (Top)", "x", "y", on_port_clicked=self.select_port
+            quad_frame, "xy", "XY View (Top)", "x", "y", on_port_clicked=self.select_port,
+            on_info=self._show_model_info,
         )
         self.view_xz = ModelOrthoCanvas2D(
-            quad_frame, "xz", "XZ View (Side)", "x", "z", on_port_clicked=self.select_port
+            quad_frame, "xz", "XZ View (Side)", "x", "z", on_port_clicked=self.select_port,
+            on_info=self._show_model_info,
         )
         self.view_3d = ModelView3DCanvas(
             quad_frame, on_port_clicked=self.select_port
         )
         self.view_yz = ModelOrthoCanvas2D(
-            quad_frame, "yz", "YZ View (Cross-Section)", "y", "z", on_port_clicked=self.select_port
+            quad_frame, "yz", "YZ View (Cross-Section)", "y", "z", on_port_clicked=self.select_port,
+            on_info=self._show_model_info,
         )
 
         self.view_xy.grid(row=0, column=0, sticky="nsew", padx=(0, 3), pady=(0, 3))
@@ -3970,14 +3989,6 @@ class FSPGuiApp:
         plot_header = tk.Frame(self.plot_panel, bg=T["panel_bg"])
         plot_header.pack(fill=tk.X, side=tk.TOP)
 
-        tk.Label(
-            plot_header,
-            text="Results Plot Window (5th Window)",
-            font=(FONT_UI, 11, "bold"),
-            bg=T["panel_bg"],
-            fg=T["text"],
-        ).pack(side=tk.LEFT, padx=(10, 8), pady=5)
-
         FlatButton(
             plot_header,
             "↗ Separate Window",
@@ -4000,6 +4011,17 @@ class FSPGuiApp:
             tooltip="Copy the currently plotted data table to the clipboard",
         ).pack(side=tk.RIGHT, padx=2, pady=3)
 
+        self._build_colormap_controls(plot_header, T["panel_bg"]).pack(side=tk.RIGHT, padx=(4, 8), pady=3)
+
+        tk.Label(
+            plot_header,
+            text="Results Plot Window (5th Window)",
+            font=(FONT_UI, 11, "bold"),
+            bg=T["panel_bg"],
+            fg=T["text"],
+            anchor="w",
+        ).pack(side=tk.LEFT, padx=(10, 8), pady=5)
+
         # Matplotlib Figure & Canvas
         self.fig = Figure(figsize=(7.6, 6.4), dpi=100, facecolor="#12151a")
         self.mpl_canvas = FigureCanvasTkAgg(self.fig, master=self.plot_panel)
@@ -4016,6 +4038,66 @@ class FSPGuiApp:
         self.main_paned.add(self.plot_panel, minsize=480, width=760)
 
         self._draw_empty_plot()
+
+    # ==================================================================
+    # Colour Maps of the Colour Plots
+    # ==================================================================
+    COLORMAP_DEFAULT = "Default"  # each plot its own: viridis for n, inferno for |E|², magma for components
+    COLORMAPS = ["plasma", "viridis", "inferno", "magma", "cividis", "turbo", "jet", "Spectral",
+                 "rainbow", "hot", "coolwarm", "RdBu", "bone", "gray"]
+
+    @classmethod
+    def colormap_choices(cls):
+        return [cls.COLORMAP_DEFAULT] + [name for name in cls.COLORMAPS if name in matplotlib.colormaps]
+
+    def _build_colormap_controls(self, parent, bg):
+        """The colour map selector and the Reverse check button, in a frame of their own."""
+        T = THEME
+        frame = tk.Frame(parent, bg=bg)
+        tk.Label(frame, text="Colors:", font=(FONT_UI, 9, "bold"), bg=bg, fg=T["text_muted"]).pack(side=tk.LEFT)
+        cmb = ttk.Combobox(frame, textvariable=self.cmap_var, state="readonly", width=9,
+                           style="Dark.TCombobox", font=(FONT_UI, 9), values=self.colormap_choices())
+        cmb.pack(side=tk.LEFT, padx=(4, 4))
+        cmb.bind("<<ComboboxSelected>>", lambda e: self._on_colormap_changed())
+        Tooltip(cmb, "Colour map of the colour plots (fields, refractive index, propagation).\n"
+                     "Default: each plot its own (viridis for n, inferno for |E|², magma for components)")
+        chk = tk.Checkbutton(frame, text="Reverse", variable=self.cmap_reverse_var,
+                             command=self._on_colormap_changed, font=(FONT_UI, 9),
+                             bg=bg, fg=T["text"], activebackground=bg, activeforeground=T["text"],
+                             selectcolor=T["entry_bg"], highlightthickness=0, bd=0)
+        chk.pack(side=tk.LEFT)
+        Tooltip(chk, "Run the colour scale the other way round")
+        return frame
+
+    def _cmap(self, default):
+        """Name of the colour map to use for a plot whose own colour map is default."""
+        name = self.cmap_var.get()
+        if name not in matplotlib.colormaps:  # "Default"
+            name = default
+        return name + "_r" if self.cmap_reverse_var.get() else name
+
+    def _colormesh(self, ax, *args, cmap, **kwargs):
+        """ax.pcolormesh with the chosen colour map (cmap: the plot's own); the mesh remembers
+        its own map, so a new choice recolours it without computing the plot again."""
+        mesh = ax.pcolormesh(*args, cmap=self._cmap(cmap), **kwargs)
+        mesh.fsp_default_cmap = cmap
+        return mesh
+
+    def _on_colormap_changed(self):
+        config = load_config()
+        config["colormap"] = self.cmap_var.get()
+        config["colormap_reversed"] = bool(self.cmap_reverse_var.get())
+        save_config(config)
+        figures = [(self.fig, self.mpl_canvas)]
+        if self.popout_win is not None and self.popout_win.winfo_exists():
+            figures.append((self.popout_fig, self.popout_canvas))
+        for fig, canvas in figures:
+            for ax in fig.axes:
+                for coll in ax.collections:
+                    default = getattr(coll, "fsp_default_cmap", None)
+                    if default:
+                        coll.set_cmap(self._cmap(default))  # its colour bar follows
+            canvas.draw_idle()
 
     # ==================================================================
     # Status Bar
@@ -4067,6 +4149,20 @@ class FSPGuiApp:
                     self.root.configure(cursor="")
                 except tk.TclError:
                     pass
+
+    def _show_model_info(self, view=None):
+        """The model summary in the status bar; with view, also how much its axes are stretched."""
+        m = self.model
+        if m is None:
+            self.status_model_lbl.config(text="")
+            return
+        text = f"{len(m.structures)} layers · {len(m.port_planes())} ports"
+        n_fm = sum(mm["has_data"] for mm in m.field_monitors)
+        if n_fm:
+            text += f" · {n_fm} monitors"
+        if view is not None:
+            text += f" · {view.view_kind.upper()} view: {view._aspect_text()}"
+        self.status_model_lbl.config(text=text)
 
     def _update_h5_status(self):
         """The right side of the status bar: which .h5 field file is open, or why there is none."""
@@ -4158,6 +4254,7 @@ class FSPGuiApp:
         self.lam_var.set(lam_choices[0])
 
         self._update_h5_status()
+        self._show_model_info()
 
         # Update 4 views and Parameter Editor
         sel_port = self.port_var.get()
@@ -4272,6 +4369,7 @@ class FSPGuiApp:
             padx=12,
             pady=4,
         ).pack(side=tk.RIGHT, padx=6)
+        self._build_colormap_controls(top, THEME["bar_bg"]).pack(side=tk.RIGHT, padx=6)
 
         self.popout_fig = Figure(figsize=(10.2, 6.8), dpi=100, facecolor="#12151a")
         self.popout_canvas = FigureCanvasTkAgg(self.popout_fig, master=win)
@@ -4411,12 +4509,12 @@ class FSPGuiApp:
             E2 = sum(np.abs(M[f"E{c}"]) ** 2 for c in "xyz")
             E2_norm = E2 / max(float(E2.max()), 1e-30)
 
-            im_n = axs[0, j].pcolormesh(y, z, M["n"], shading="auto", cmap="viridis", vmin=1.0, vmax=max(2.0, float(M["n"].max())))
+            im_n = self._colormesh(axs[0, j], y, z, M["n"], shading="auto", cmap="viridis", vmin=1.0, vmax=max(2.0, float(M["n"].max())))
             x_val = port_x_map.get(pname, 0.0)
             neff_str = f", n_eff={neff:.4f}" if neff else ""
             axs[0, j].set_title(f"{pname} (x={x_val:.1f} μm)\nRefractive index{neff_str}", fontsize=9)
 
-            im_e = axs[1, j].pcolormesh(y, z, E2_norm, shading="auto", cmap="inferno", vmin=0.0, vmax=1.0)
+            im_e = self._colormesh(axs[1, j], y, z, E2_norm, shading="auto", cmap="inferno", vmin=0.0, vmax=1.0)
             try:
                 axs[1, j].contour(y, z, M["n"], levels=[1.2, 1.445, 1.7], colors="w", linewidths=0.5)
             except Exception:
@@ -4470,12 +4568,12 @@ class FSPGuiApp:
             ax = axs[0, j]
             if quantity == "n":
                 mat = M["n"]
-                im = ax.pcolormesh(y, z, mat, shading="auto", cmap="viridis")
+                im = self._colormesh(ax, y, z, mat, shading="auto", cmap="viridis")
                 ax.set_title(f"{pname}\nRefractive index n(y, z)", fontsize=9.5)
             else:
                 E2 = sum(np.abs(M[f"E{c}"]) ** 2 for c in "xyz")
                 mat = E2 / max(float(E2.max()), 1e-30)
-                im = ax.pcolormesh(y, z, mat, shading="auto", cmap="inferno", vmin=0.0, vmax=1.0)
+                im = self._colormesh(ax, y, z, mat, shading="auto", cmap="inferno", vmin=0.0, vmax=1.0)
                 try:
                     ax.contour(y, z, M["n"], levels=[1.2, 1.445, 1.7], colors="w", linewidths=0.6)
                 except Exception:
@@ -4536,7 +4634,7 @@ class FSPGuiApp:
             else:
                 yy, E2f = y, E2
             E2_norm = E2f / max(float(E2f.max()), 1e-300)
-            im = ax.pcolormesh(yy, z, E2_norm, shading="auto", cmap="inferno", vmin=0.0, vmax=1.0)
+            im = self._colormesh(ax, yy, z, E2_norm, shading="auto", cmap="inferno", vmin=0.0, vmax=1.0)
             if name in port_names:
                 try:
                     ys, zs, M, _, _ = self.model.stored_mode(name)
@@ -4892,7 +4990,7 @@ class FSPGuiApp:
             (axs[1], (185.0, float(x[-1])) if x[-1] > 190 else None, "Tip & output ports zoom"),
         ):
             sel = slice(None) if xr is None else (x >= xr[0]) & (x <= xr[1])
-            im = ax.pcolormesh(x[sel], z, dB[:, sel], shading="auto", cmap="inferno", vmin=-35, vmax=0, rasterized=True)
+            im = self._colormesh(ax, x[sel], z, dB[:, sel], shading="auto", cmap="inferno", vmin=-35, vmax=0, rasterized=True)
             # Draw yellow port lines on top of XZ field
             for pt in self.model.ports:
                 if xr is None or (xr[0] <= pt["x"] <= xr[1]):
@@ -5000,7 +5098,7 @@ class FSPGuiApp:
         export_list = []
         for cname, ax in comps:
             arr = np.abs(M[cname])
-            im = ax.pcolormesh(y, z, arr, shading="auto", cmap="magma")
+            im = self._colormesh(ax, y, z, arr, shading="auto", cmap="magma")
             ax.set_title(f"|{cname}| ({target})", fontsize=9)
             ax.set_aspect("equal")
             ax.set_xlabel("y (μm)")

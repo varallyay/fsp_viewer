@@ -2,7 +2,7 @@
 
 <img src="icon.png" width="96" alt="FSP Viewer icon: a black square on a yellow background">
 
-**Version 0.2.3** — see [Version History](#version-history).
+**Version 0.2.4** — see [Version History](#version-history).
 
 View Ansys Lumerical FDTD project files (`.fsp`), plot their results and save their geometry as GDS **without a Lumerical license**, on macOS and Linux, and on Windows as a ready-to-run program that needs no Python (see [Windows application](#windows-application)).
 
@@ -92,12 +92,12 @@ An installed FSP Viewer looks for a new version on <https://github.com/varallyay
 The window title names the open project, and the `.h5` field file in brackets when one is open: `FSP Viewer — model.fsp (model_output.h5)`.
 
 ### Status bar
-The thin bar at the bottom says what the program is doing — opening a file, drawing the views, computing a plot (⏳, with a busy cursor) — and afterwards what came of it: the project loaded (structures, ports, monitors, time taken), the plot drawn, a file saved, data copied, or why a plot could not be made. On the right it shows the `.h5` field file that is open, or why there is none (not found, found but not opened because the project holds no results, or `h5py` missing).
+The thin bar at the bottom says what the program is doing — opening a file, drawing the views, computing a plot (⏳, with a busy cursor) — and afterwards what came of it: the project loaded (structures, ports, monitors, time taken), the plot drawn, a file saved, data copied, or why a plot could not be made. On the right it shows the size of the model (layers, ports, monitors), with the pointer over a 2D view also how much that view stretches one axis (e.g. `XY view: y ×6.3`, or `1:1`), and the `.h5` field file that is open, or why there is none (not found, found but not opened because the project holds no results, or `h5py` missing).
 
 ### Geometry views
 Four linked views of the model, with lengths in µm:
 
-- **XY (top)**, **XZ (side)** and **YZ (cross-section)**: drag to pan, scroll to zoom, **Fit** resets the view; the position of the pointer is shown in the header. The XY view has **Zoom Core**, which stretches y around the waveguide so that narrow tapers become visible.
+- **XY (top)**, **XZ (side)** and **YZ (cross-section)**: drag to pan, scroll to zoom, **Fit** resets the view; the position of the pointer is shown in the header, the stretch of the axes in the status bar. The XY view has **Zoom Core**, which stretches y around the waveguide so that narrow tapers become visible.
 - **3D**: drag to rotate, right-drag to pan, scroll to zoom, **Reset view**; **Slabs** shows or hides the full-wafer layers (substrate, cladding). Badges give the size of the scene.
 - **Structures**: layer-builder layers with their GDS polygons, and rectangle and polygon objects, also inside structure groups. Each material has a colour; a shape inside another one (an active layer in its cladding) is drawn on top. Disabled objects are not shown.
 - **FDTD region**: the dashed orange box.
@@ -112,7 +112,7 @@ A read-only inspector with line numbers and syntax colours:
 - **Filter** shows only the lines that contain a text; **Copy Text** copies the page to the clipboard.
 
 ### Result plots
-The plot is drawn in the large panel on the right, with the matplotlib toolbar (zoom, pan, save as image); **↗ Separate Window** opens it in a window of its own.
+The plot is drawn in the large panel on the right, with the matplotlib toolbar (zoom, pan, save as image); **↗ Separate Window** opens it in a window of its own. **Colors** chooses the colour map of the colour plots (fields, refractive index, XZ propagation): *Default* keeps each plot's own (viridis for n, inferno for \|E\|², magma for the field components), or plasma, viridis, inferno, magma, cividis, turbo, jet, Spectral, rainbow, hot, coolwarm, RdBu, bone, gray; **Reverse** runs the scale the other way. The plot is recoloured without being computed again, and the choice is remembered.
 
 | Result | Needs `.h5` | What it shows |
 | :--- | :---: | :--- |
@@ -159,7 +159,7 @@ The parameters at the top of `fsp_gui.py`:
 | Parameter | Default | Meaning |
 | :--- | :--- | :--- |
 | `APP_NAME` | `"FSP Viewer"` | Window title and name of the installed application |
-| `APP_VERSION` | `"0.2.3"` | Version number; decides whether a copy on GitHub is newer |
+| `APP_VERSION` | `"0.2.4"` | Version number; decides whether a copy on GitHub is newer |
 | `APP_ICON_YELLOW`, `APP_ICON_BLACK` | `"#ffd700"`, `"#000000"` | Colours of the icon |
 | `APP_ICON_SQUARE` | `0.5` | Side of the black square, as a fraction of the yellow field |
 | `APP_ICON_MARGIN` | `0.1` | Transparent margin on each side, as a fraction of the icon size |
@@ -186,7 +186,7 @@ On Windows FSP Viewer also runs **without Python and without installing anything
 - The program looks for a new version once a week; it cannot replace itself, so it offers the download page of the new release. Unpack the new `.zip` and delete the old folder.
 - Messages and error reports go to `%USERPROFILE%\.fsp_viewer.log` (the program has no console window); settings to `%USERPROFILE%\.fsp_viewer.json`.
 
-**How it is built.** The GitHub Actions workflow `.github/workflows/windows.yml` runs `build_windows.py` on a Windows machine of GitHub whenever a version tag is pushed (`git tag v0.2.3 && git push origin v0.2.3`; the tag must match `APP_VERSION`), and attaches the `.zip` to that release; started by hand (*Actions > Windows build > Run workflow*) it only keeps the `.zip` as a download of the run. `build_windows.py` packs the program with PyInstaller, gives the `.exe` its icon and version information, starts the packed program in a self-test (every library present, the window opens) and makes the `.zip`. To build on a Windows PC yourself:
+**How it is built.** The GitHub Actions workflow `.github/workflows/windows.yml` runs `build_windows.py` on a Windows machine of GitHub whenever a version tag is pushed (`git tag v0.2.4 && git push origin v0.2.4`; the tag must match `APP_VERSION`), and attaches the `.zip` to that release; started by hand (*Actions > Windows build > Run workflow*) it only keeps the `.zip` as a download of the run. `build_windows.py` packs the program with PyInstaller, gives the `.exe` its icon and version information, starts the packed program in a self-test (every library present, the window opens) and makes the `.zip`. To build on a Windows PC yourself:
 
 ```bat
 python -m pip install -r requirements-windows.txt
@@ -262,6 +262,10 @@ Nodes tagged `1000` (structures and layer-builder internals) start with a partly
 ---
 
 ## Version History
+
+### 0.2.4 — 2026-11-19
+- **2D views**: the layers · ports · monitors summary and the axis stretch moved from the headers of the XY, XZ and YZ views to the status bar (in narrow views it pushed the pointer position out of sight).
+- **Colour maps**: a **Colors** selector (plasma, turbo, jet, Spectral, …) and a **Reverse** check button for the colour plots, in the plot panel and the separate plot window.
 
 ### 0.2.3 — 2026-11-19
 - **Status bar** at the bottom of the window: what is being done (opening, drawing, computing), its outcome and time, and the state of the `.h5` field file. The file names moved from the toolbar to the window title (long names pushed the Port and Result selectors out of the window).
