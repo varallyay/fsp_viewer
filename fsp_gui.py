@@ -57,6 +57,7 @@ import urllib.request
 import webbrowser
 import zipfile
 from tkinter import filedialog, messagebox, ttk
+import tkinter.font as tkfont
 
 import numpy as np
 
@@ -121,6 +122,111 @@ elif sys.platform.startswith("win"):
     FONT_UI, FONT_MONO = "Segoe UI", "Consolas"
 else:
     FONT_UI, FONT_MONO = "DejaVu Sans", "DejaVu Sans Mono"
+
+# ======================================================================
+# Sizes on the screen: fonts, gaps and margins
+# ======================================================================
+# The sizes in the program are pixels of a macOS screen, where a point of a font is one pixel.
+# Windows and Linux count more pixels per point (96 per inch instead of 72, and more on a scaled
+# display), so there the sizes are multiplied by UI_SCALE, and the fonts are given in pixels: text
+# and the gaps around it keep the proportions they have on the Mac. The fonts are named Tk fonts,
+# so a new font or font size (File > Settings) changes the text in the open windows at once.
+FONT_SIZE_DEFAULT = 10      # size of the normal text (pt); the settings can change it, all text follows
+UI_SCALE_CHOICES = (100, 125, 150, 175, 200)   # interface scales (%) offered besides "Automatic"
+LAYOUT_DEFAULTS = {"split_plot": 0.53,     # width of the views (and the parameters) : the whole width
+                   "split_editor": 0.64}   # height of the four views : the left side
+UI_SCALE = 1.0              # set by init_ui_scale() when the main window opens
+UI = {"font": FONT_UI, "mono": FONT_MONO, "size": FONT_SIZE_DEFAULT}
+_FONTS = {}                 # the named fonts made by ui_font(): (size, weight, mono) -> tkinter.font.Font
+
+
+def dpx(n):
+    """A size in pixels of the Mac (gap, padding, window size) in pixels of this screen."""
+    return int(round(n * UI_SCALE))
+
+
+def text_scale():
+    return UI_SCALE * UI["size"] / FONT_SIZE_DEFAULT
+
+
+def tx(n):
+    """A size that goes with the text (a margin for tick labels, a line of labels) in pixels of this screen."""
+    return int(round(n * text_scale()))
+
+
+def ui_font(size, bold=False, mono=False):
+    """The named font of the program for text of `size` points at the standard font size."""
+    weight = "bold" if bold else "normal"
+    key = (size, weight, mono)
+    font = _FONTS.get(key)
+    if font is None:
+        font = _FONTS[key] = tkfont.Font(family=UI["mono" if mono else "font"], size=-max(6, tx(size)),
+                                         weight=weight)
+    return font
+
+
+def mono_font(size, bold=False):
+    return ui_font(size, bold, mono=True)
+
+
+def set_fonts(family=None, mono=None, size=None):
+    """Change the fonts or the font size; every widget and canvas text using them follows."""
+    if family:
+        UI["font"] = family
+    if mono:
+        UI["mono"] = mono
+    if size:
+        UI["size"] = size
+    for (sz, _weight, is_mono), font in _FONTS.items():
+        font.configure(family=UI["mono" if is_mono else "font"], size=-max(6, tx(sz)))
+
+
+def system_ui_scale(root):
+    """How many times more pixels this screen has per point than the Mac (1 on macOS, which scales itself)."""
+    if sys.platform == "darwin":
+        return 1.0
+    try:
+        return min(4.0, max(1.0, round(root.winfo_fpixels("1i") / 96, 2)))
+    except tk.TclError:
+        return 1.0
+
+
+def init_ui_scale(root, setting="auto"):
+    """Set UI_SCALE from the setting: "auto" (from the screen) or a percentage."""
+    global UI_SCALE
+    try:
+        UI_SCALE = min(4.0, max(0.5, float(setting) / 100))
+    except (TypeError, ValueError):
+        UI_SCALE = system_ui_scale(root)
+    return UI_SCALE
+
+
+def enable_windows_dpi_awareness():
+    """Tell Windows that the program scales itself. Otherwise a scaled display (125 %, 150 %) gets a
+    stretched, blurred picture of the window. Call it before the first Tk window opens."""
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)  # system DPI aware (Windows 8.1 and newer)
+        except (AttributeError, OSError):
+            ctypes.windll.user32.SetProcessDPIAware()      # Windows Vista, 7
+    except Exception:
+        pass
+
+
+class FigureCanvas(FigureCanvasTkAgg):
+    """Matplotlib canvas that draws the plots at the scale of the rest of the window (matplotlib
+    by itself would follow the system's DPI on Windows and Linux, and ignore the interface scale)."""
+
+    def _update_device_pixel_ratio(self, event=None):
+        try:
+            if self._set_device_pixel_ratio(UI_SCALE):
+                w, h = self.get_width_height(physical=True)
+                self._tkcanvas.configure(width=w, height=h)
+        except AttributeError:  # another matplotlib version: its own way
+            super()._update_device_pixel_ratio(event)
 
 THEME = {
     "app_bg": "#0f1115",
@@ -1544,9 +1650,9 @@ class FlatButton(tk.Label):
             text=text,
             bg=bg,
             fg=fg,
-            font=(FONT_UI, size, "bold" if bold else "normal"),
-            padx=padx,
-            pady=pady,
+            font=ui_font(size, bold),
+            padx=dpx(padx),
+            pady=dpx(pady),
             cursor="hand2",
         )
         self._bg, self._hover, self._fg = bg, hover, fg
@@ -1587,7 +1693,7 @@ class Tooltip:
         if self._tip is not None:
             return
         x = self.widget.winfo_rootx()
-        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + dpx(6)
         self._tip = tw = tk.Toplevel(self.widget)
         tw.wm_overrideredirect(True)
         tw.wm_geometry(f"+{x}+{y}")
@@ -1597,9 +1703,9 @@ class Tooltip:
             justify=tk.LEFT,
             bg="#262c36",
             fg=THEME["text"],
-            font=(FONT_UI, 10),
-            padx=8,
-            pady=5,
+            font=ui_font(10),
+            padx=dpx(8),
+            pady=dpx(5),
             highlightthickness=1,
             highlightbackground=THEME["border"],
         ).pack()
@@ -1628,7 +1734,7 @@ def apply_ttk_dark_style(root):
         darkcolor=THEME["entry_bg"],
         selectbackground=THEME["entry_bg"],
         selectforeground=THEME["text"],
-        padding=4,
+        padding=dpx(4),
     )
     style.map(
         "Dark.TCombobox",
@@ -1637,11 +1743,24 @@ def apply_ttk_dark_style(root):
         bordercolor=[("focus", THEME["accent"])],
         background=[("active", THEME["btn_hover"])],
     )
+    style.configure(
+        "Dark.TSpinbox",
+        fieldbackground=THEME["entry_bg"],
+        background=THEME["btn_bg"],
+        foreground=THEME["text"],
+        arrowcolor=THEME["text_muted"],
+        bordercolor=THEME["border"],
+        lightcolor=THEME["entry_bg"],
+        darkcolor=THEME["entry_bg"],
+        insertcolor=THEME["text"],
+        padding=dpx(3),
+    )
+    style.map("Dark.TSpinbox", bordercolor=[("focus", THEME["accent"])], background=[("active", THEME["btn_hover"])])
     root.option_add("*TCombobox*Listbox.background", THEME["bar_bg"])
     root.option_add("*TCombobox*Listbox.foreground", THEME["text"])
     root.option_add("*TCombobox*Listbox.selectBackground", THEME["accent"])
     root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
-    root.option_add("*TCombobox*Listbox.font", (FONT_UI, 11))
+    root.option_add("*TCombobox*Listbox.font", str(ui_font(11)))
 
 
 def _wheel_event(event, direction):
@@ -1692,7 +1811,7 @@ class ModelOrthoCanvas2D(tk.Frame):
         tk.Label(
             header,
             text=self.title,
-            font=(FONT_UI, 11, "bold"),
+            font=ui_font(11, bold=True),
             bg=THEME["panel_bg"],
             fg=THEME["text"],
             anchor="w",
@@ -1702,7 +1821,7 @@ class ModelOrthoCanvas2D(tk.Frame):
             header,
             text="",
             anchor="w",
-            font=(FONT_MONO, 9),
+            font=mono_font(9),
             bg=THEME["panel_bg"],
             fg=THEME["text_muted"],
         )
@@ -1737,6 +1856,7 @@ class ModelOrthoCanvas2D(tk.Frame):
         self.canvas = tk.Canvas(self, bg=THEME["plot_bg"], highlightthickness=0, cursor="crosshair")
         self.canvas.pack(fill=tk.BOTH, expand=True)
 
+        # margins around the plot (Mac pixels at the standard font size): tick labels and axis titles
         self.margin_left = 52
         self.margin_right = 14
         self.margin_top = 16
@@ -1824,10 +1944,10 @@ class ModelOrthoCanvas2D(tk.Frame):
     def _plot_rect(self):
         w = max(self.canvas.winfo_width(), 80)
         h = max(self.canvas.winfo_height(), 80)
-        x0 = self.margin_left
-        y0 = self.margin_top
-        x1 = max(x0 + 20, w - self.margin_right)
-        y1 = max(y0 + 20, h - self.margin_bottom)
+        x0 = tx(self.margin_left)
+        y0 = tx(self.margin_top)
+        x1 = max(x0 + 20, w - dpx(self.margin_right))
+        y1 = max(y0 + 20, h - tx(self.margin_bottom))
         return x0, y0, x1, y1
 
     def uv_to_px(self, u, v):
@@ -1848,8 +1968,8 @@ class ModelOrthoCanvas2D(tk.Frame):
 
     def tick_steps(self):
         x0, y0, x1, y1 = self._plot_rect()
-        su = nice_tick_step(self.u_range[1] - self.u_range[0], x1 - x0, 68)
-        sv = nice_tick_step(self.v_range[1] - self.v_range[0], y1 - y0, 36)
+        su = nice_tick_step(self.u_range[1] - self.u_range[0], x1 - x0, tx(68))
+        sv = nice_tick_step(self.v_range[1] - self.v_range[0], y1 - y0, tx(36))
         return (su, minor_tick_step(su)), (sv, minor_tick_step(sv))
 
     def _on_motion(self, event):
@@ -1963,7 +2083,7 @@ class ModelOrthoCanvas2D(tk.Frame):
 
         u_min, u_max = self.u_range
         v_min, v_max = self.v_range
-        tick_font = (FONT_UI, 8)
+        tick_font = ui_font(8)
 
         # 1. Grid and ticks
         (step_u, minor_u), (step_v, minor_v) = self.tick_steps()
@@ -1992,16 +2112,16 @@ class ModelOrthoCanvas2D(tk.Frame):
                 if is_major:
                     label = format_tick(val, step)
                     if vertical:
-                        c.create_text(px, y1 + 10, text=label, font=tick_font, fill=T["text_muted"])
+                        c.create_text(px, y1 + tx(10), text=label, font=tick_font, fill=T["text_muted"])
                     else:
-                        c.create_text(x0 - 5, py, text=label, font=tick_font, fill=T["text_muted"], anchor="e")
+                        c.create_text(x0 - dpx(5), py, text=label, font=tick_font, fill=T["text_muted"], anchor="e")
 
         # Axis titles
         c.create_text(
-            (x0 + x1) / 2, y1 + 22, text=f"{self.u_label} (μm)", font=(FONT_UI, 9, "bold"), fill=T["text_muted"]
+            (x0 + x1) / 2, y1 + tx(22), text=f"{self.u_label} (μm)", font=ui_font(9, bold=True), fill=T["text_muted"]
         )
         c.create_text(
-            15, (y0 + y1) / 2, text=f"{self.v_label}\n(μm)", font=(FONT_UI, 9, "bold"), fill=T["text_muted"],
+            tx(15), (y0 + y1) / 2, text=f"{self.v_label}\n(μm)", font=ui_font(9, bold=True), fill=T["text_muted"],
             justify=tk.CENTER,
         )
 
@@ -2010,7 +2130,7 @@ class ModelOrthoCanvas2D(tk.Frame):
                 (x0 + x1) / 2,
                 (y0 + y1) / 2,
                 text="Open an .fsp file to visualize the model",
-                font=(FONT_UI, 11),
+                font=ui_font(11),
                 fill=T["text_dim"],
             )
             return
@@ -2047,7 +2167,7 @@ class ModelOrthoCanvas2D(tk.Frame):
             px1, py0 = self.uv_to_px(st[u + "max"], st["zmax"])
             vx0, vx1 = max(x0, min(px0, px1)), min(x1, max(px0, px1))
             vy0, vy1 = max(y0, min(py0, py1)), min(y1, max(py0, py1))
-            if vy1 - vy0 < 12 or vx1 - vx0 < 40:
+            if vy1 - vy0 < tx(12) or vx1 - vx0 < tx(40):
                 continue
             labelled.add(st["layer_name"])
             if self.view_kind == "xz":
@@ -2056,7 +2176,7 @@ class ModelOrthoCanvas2D(tk.Frame):
             else:
                 text = st["layer_name"] + (f" (n={st['n']:.3f})" if st["n"] else "")
                 fill = T["text_muted"]
-            c.create_text(vx0 + 6, 0.5 * (vy0 + vy1), text=text, font=(FONT_UI, 8), fill=fill, anchor="w")
+            c.create_text(vx0 + dpx(6), 0.5 * (vy0 + vy1), text=text, font=ui_font(8), fill=fill, anchor="w")
 
         # 3. Draw FDTD region in orange
         if self.model.fdtd_box:
@@ -2068,10 +2188,10 @@ class ModelOrthoCanvas2D(tk.Frame):
             if rx1 > x0 + 30 and rx0 < x1 and ry0 < y1 - 10 and ry1 > y0:  # label only when the box is in view
                 # bottom right corner: the port labels are at the top
                 c.create_text(
-                    min(x1 - 4, max(x0 + 30, rx1 - 4)),
-                    max(y0 + 12, min(y1 - 3, ry1 - 3)),
+                    min(x1 - dpx(4), max(x0 + tx(30), rx1 - dpx(4))),
+                    max(y0 + tx(12), min(y1 - dpx(3), ry1 - dpx(3))),
                     text="FDTD",
-                    font=(FONT_UI, 8, "bold"),
+                    font=ui_font(8, bold=True),
                     fill=T["fdtd_orange"],
                     anchor="se",
                 )
@@ -2100,7 +2220,7 @@ class ModelOrthoCanvas2D(tk.Frame):
             sel = next((mm for mm in self.model.field_monitors if mm["name"] == self.selected_port), None)
             text = (f"{sel['name']} (x={sel['x']:.4g} μm)" if sel else
                     f"{n_mon} field monitor{'s' if n_mon > 1 else ''} (cyan)")
-            c.create_text(x0 + 6, y1 - 6, text=text, font=(FONT_UI, 8, "bold"),
+            c.create_text(x0 + dpx(6), y1 - dpx(6), text=text, font=ui_font(8, bold=True),
                           fill=T["monitor_cyan_bright"] if sel else T["monitor_cyan"], anchor="sw")
 
         # 4. Draw PORTS (and mode expansion monitors) in YELLOW (#ffd700 / #ffee55)
@@ -2123,11 +2243,11 @@ class ModelOrthoCanvas2D(tk.Frame):
                 seg = self._clipped_line(px, pa, px, pb, fill=p_color, width=lw)
                 for py in (pa, pb):
                     if y0 <= py <= y1:
-                        c.create_oval(px - 3, py - 3, px + 3, py + 3, fill=p_color, outline="#000000")
+                        c.create_oval(px - dpx(3), py - dpx(3), px + dpx(3), py + dpx(3), fill=p_color, outline="#000000")
                 if self.view_kind == "xy" and pt["direction"]:  # direction arrow at port center
                     _, pyc = self.uv_to_px(pt["x"], pt["y"])
                     if y0 <= pyc <= y1:
-                        arr_dx = 10 if pt["direction"] == "+" else -10
+                        arr_dx = dpx(10) if pt["direction"] == "+" else -dpx(10)
                         c.create_line(px, pyc, px + arr_dx, pyc, fill=p_color, width=2, arrow=tk.LAST)
                 if seg:
                     self._port_hit_boxes.append((pt["name"], px - 6, min(seg[1], seg[3]), px + 6, max(seg[1], seg[3])))
@@ -2137,10 +2257,10 @@ class ModelOrthoCanvas2D(tk.Frame):
                                dash=() if is_sel else (4, 2))
                 py1, pz0 = self.uv_to_px(pt["ymax"], pt["zmax"])
                 c.create_text(
-                    min(x1, py1) - 4,
-                    max(y0, pz0) + 10 + 12 * pt["index"],  # one line per port: they share this frame
+                    min(x1, py1) - dpx(4),
+                    max(y0, pz0) + tx(10) + tx(12) * pt["index"],  # one line per port: they share this frame
                     text=f"{pt['name']} (x={pt['x']:g} μm)" + ("" if pt["enabled"] else ", disabled"),
-                    font=(FONT_UI, 8, "bold"),
+                    font=ui_font(8, bold=True),
                     fill=p_color,
                     anchor="ne",
                 )
@@ -2153,12 +2273,12 @@ class ModelOrthoCanvas2D(tk.Frame):
                 px, _ = self.uv_to_px(pt["x"], 0)
                 if not (x0 <= px <= x1):
                     continue
-                if px - last_px < 34:
+                if px - last_px < tx(34):
                     row_idx = (row_idx + 1) % 3
                 else:
                     row_idx = 0
                     last_px = px
-                lbl_y = y0 + 10 + row_idx * 13
+                lbl_y = y0 + tx(10) + row_idx * tx(13)
                 is_sel = pt["name"] == self.selected_port
                 short_lbl = pt["name"].replace("output_port", "P").replace("input_port", "In")
                 if not pt["enabled"]:
@@ -2167,7 +2287,7 @@ class ModelOrthoCanvas2D(tk.Frame):
                     px,
                     lbl_y,
                     text=short_lbl,
-                    font=(FONT_MONO, 8, "bold"),
+                    font=mono_font(8, bold=True),
                     fill="#0f1115" if is_sel else T["port_yellow"] if pt["enabled"] else "#8a7a1a",
                 )
                 bx0, by0, bx1, by1 = c.bbox(tid)
@@ -2191,13 +2311,13 @@ class ModelOrthoCanvas2D(tk.Frame):
                 px, _ = self.uv_to_px(mm["x"], 0)
                 if not (x0 <= px <= x1):
                     continue
-                if px - last_px < 52:
+                if px - last_px < tx(52):
                     row_idx = (row_idx + 1) % 3
                 else:
                     row_idx, last_px = 0, px
                 is_sel = mm["name"] == self.selected_port
                 label = mm["name"][3:] if mm["name"].startswith(("yz_", "yz ")) else mm["name"]
-                tid = c.create_text(px, y1 - 9 - row_idx * 13, text=label, font=(FONT_MONO, 8, "bold"),
+                tid = c.create_text(px, y1 - tx(9) - row_idx * tx(13), text=label, font=mono_font(8, bold=True),
                                     fill="#0f1115" if is_sel else T["monitor_cyan"])
                 bx0, by0, bx1, by1 = c.bbox(tid)
                 bg = c.create_rectangle(bx0 - 3, by0 - 1, bx1 + 3, by1 + 1,
@@ -2234,7 +2354,7 @@ class ModelView3DCanvas(tk.Frame):
         tk.Label(
             header,
             text="3D View (x-y-z)",
-            font=(FONT_UI, 11, "bold"),
+            font=ui_font(11, bold=True),
             bg=THEME["panel_bg"],
             fg=THEME["text"],
             anchor="w",
@@ -2243,7 +2363,7 @@ class ModelView3DCanvas(tk.Frame):
         tk.Label(
             header,
             text="drag to rotate · scroll to zoom",
-            font=(FONT_UI, 9),
+            font=ui_font(9),
             bg=THEME["panel_bg"],
             fg=THEME["text_dim"],
         ).pack(side=tk.LEFT, padx=4)
@@ -2569,11 +2689,11 @@ class ModelView3DCanvas(tk.Frame):
 
         if self.model is None or self.bbox_3d is None:
             c.create_text(
-                cx, cy - 8, text="3D Viewport", font=(FONT_UI, 13, "bold"), fill=THEME["text_muted"]
+                cx, cy - tx(8), text="3D Viewport", font=ui_font(13, bold=True), fill=THEME["text_muted"]
             )
             c.create_text(
-                cx, cy + 14, text="Open an .fsp file to inspect 3D geometry & ports",
-                font=(FONT_UI, 10), fill=THEME["text_dim"],
+                cx, cy + tx(14), text="Open an .fsp file to inspect 3D geometry & ports",
+                font=ui_font(10), fill=THEME["text_dim"],
             )
             self._draw_axes_triad(w, h)
             return
@@ -2621,7 +2741,7 @@ class ModelView3DCanvas(tk.Frame):
             short = pf["name"].replace("output_port", "P").replace("input_port", "In")
             if not pf["enabled"]:
                 short += " (off)"
-            self._badge(top_x, top_y - 8, short, color, font=(FONT_MONO, 8, "bold"))
+            self._badge(top_x, top_y - tx(8), short, color, font=mono_font(8, bold=True))
 
         # Dimension badges
         xmin, xmax, ymin, ymax, zmin, zmax = self.model.fdtd_box or self.bbox_3d
@@ -2629,35 +2749,35 @@ class ModelView3DCanvas(tk.Frame):
         p_x1 = self._project_point(xmax, ymin, zmin, cx, cy, scale)
         p_y1 = self._project_point(xmax, ymax, zmin, cx, cy, scale)
         p_z1 = self._project_point(xmax, ymin, zmax, cx, cy, scale)
-        self._badge(0.5 * (p_x0[0] + p_x1[0]), 0.5 * (p_x0[1] + p_x1[1]) + 14, f"Δx={xmax - xmin:g} μm", "#74c0fc")
-        self._badge(0.5 * (p_x1[0] + p_y1[0]) + 24, 0.5 * (p_x1[1] + p_y1[1]) + 8, f"Δy={ymax - ymin:g} μm", "#63e6be")
-        self._badge(0.5 * (p_x1[0] + p_z1[0]) + 30, 0.5 * (p_x1[1] + p_z1[1]), f"Δz={zmax - zmin:g} μm", "#ffa8a8")
+        self._badge(0.5 * (p_x0[0] + p_x1[0]), 0.5 * (p_x0[1] + p_x1[1]) + tx(14), f"Δx={xmax - xmin:g} μm", "#74c0fc")
+        self._badge(0.5 * (p_x1[0] + p_y1[0]) + tx(24), 0.5 * (p_x1[1] + p_y1[1]) + tx(8), f"Δy={ymax - ymin:g} μm", "#63e6be")
+        self._badge(0.5 * (p_x1[0] + p_z1[0]) + tx(30), 0.5 * (p_x1[1] + p_z1[1]), f"Δz={zmax - zmin:g} μm", "#ffa8a8")
 
         # Legend pill in top-left corner
         tid = c.create_text(
-            14, 12,
+            dpx(14), dpx(12),
             text=f"■ Ports ({len(self.port_faces_3d) - sum(pf.get('kind') == 'monitor' for pf in self.port_faces_3d)})"
                  f" in Yellow   ■ FDTD Box",
-            font=(FONT_UI, 9, "bold"),
+            font=ui_font(9, bold=True),
             fill=THEME["port_yellow"],
             anchor="nw",
         )
         n_mon = sum(pf.get("kind") == "monitor" for pf in self.port_faces_3d)
         if n_mon:
-            c.create_text(c.bbox(tid)[2] + 12, 12, text=f"■ Field monitors ({n_mon})", font=(FONT_UI, 9, "bold"),
+            c.create_text(c.bbox(tid)[2] + tx(12), dpx(12), text=f"■ Field monitors ({n_mon})", font=ui_font(9, bold=True),
                           fill=THEME["monitor_cyan"], anchor="nw")
 
         self._draw_axes_triad(w, h)
 
-    def _badge(self, x, y, text, color, font=(FONT_UI, 8, "bold")):
-        tid = self.canvas.create_text(x, y, text=text, font=font, fill=color)
+    def _badge(self, x, y, text, color, font=None):
+        tid = self.canvas.create_text(x, y, text=text, font=font or ui_font(8, bold=True), fill=color)
         bx0, by0, bx1, by1 = self.canvas.bbox(tid)
-        bg = self.canvas.create_rectangle(bx0 - 4, by0 - 1, bx1 + 4, by1 + 1, fill=THEME["app_bg"], outline="")
+        bg = self.canvas.create_rectangle(bx0 - dpx(4), by0 - 1, bx1 + dpx(4), by1 + 1, fill=THEME["app_bg"], outline="")
         self.canvas.tag_lower(bg, tid)
 
     def _draw_axes_triad(self, w, h):
-        ox, oy = 42, h - 34
-        axis_len = 24
+        ox, oy = dpx(42), h - dpx(34)
+        axis_len = dpx(24)
         az = math.radians(self.azim)
         el = math.radians(self.elev)
         cos_a, sin_a = math.cos(az), math.sin(az)
@@ -2678,7 +2798,7 @@ class ModelView3DCanvas(tk.Frame):
                 sx + (sx - ox) * 0.3,
                 sy + (sy - oy) * 0.3,
                 text=label,
-                font=(FONT_UI, 9, "bold"),
+                font=ui_font(9, bold=True),
                 fill=color,
             )
 
@@ -2708,7 +2828,7 @@ class ParameterEditorPanel(tk.Frame):
         tk.Label(
             header,
             text="Model Parameters Editor",
-            font=(FONT_UI, 11, "bold"),
+            font=ui_font(11, bold=True),
             bg=THEME["panel_bg"],
             fg=THEME["text"],
         ).pack(side=tk.LEFT, padx=(10, 8), pady=5)
@@ -2745,7 +2865,7 @@ class ParameterEditorPanel(tk.Frame):
             header,
             textvariable=self.filter_var,
             width=18,
-            font=(FONT_MONO, 10),
+            font=mono_font(10),
             bg=THEME["entry_bg"],
             fg=THEME["text"],
             insertbackground=THEME["text"],
@@ -2756,7 +2876,7 @@ class ParameterEditorPanel(tk.Frame):
         )
         ent_filter.pack(side=tk.RIGHT, padx=4, pady=4, ipady=2)
         tk.Label(
-            header, text="Filter:", font=(FONT_UI, 9), bg=THEME["panel_bg"], fg=THEME["text_muted"]
+            header, text="Filter:", font=ui_font(9), bg=THEME["panel_bg"], fg=THEME["text_muted"]
         ).pack(side=tk.RIGHT, padx=(6, 2))
 
         # Editor body: line-number gutter + main text area + scrollbars
@@ -2773,7 +2893,7 @@ class ParameterEditorPanel(tk.Frame):
             pady=6,
             bg="#141820",
             fg=THEME["text_dim"],
-            font=(FONT_MONO, 10),
+            font=mono_font(10),
             relief=tk.FLAT,
             highlightthickness=0,
             state=tk.DISABLED,
@@ -2789,7 +2909,7 @@ class ParameterEditorPanel(tk.Frame):
             insertbackground=THEME["text"],
             selectbackground=THEME["accent"],
             selectforeground="#ffffff",
-            font=(FONT_MONO, 10),
+            font=mono_font(10),
             relief=tk.FLAT,
             highlightthickness=0,
             wrap=tk.NONE,
@@ -2806,8 +2926,8 @@ class ParameterEditorPanel(tk.Frame):
         self.text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         # Syntax highlight tags
-        self.text.tag_configure("section", foreground="#6aa1ff", font=(FONT_MONO, 10, "bold"))
-        self.text.tag_configure("port_line", foreground=THEME["port_yellow"], font=(FONT_MONO, 10, "bold"))
+        self.text.tag_configure("section", foreground="#6aa1ff", font=mono_font(10, bold=True))
+        self.text.tag_configure("port_line", foreground=THEME["port_yellow"], font=mono_font(10, bold=True))
         self.text.tag_configure("key", foreground="#7ee2b0")
         self.text.tag_configure("comment", foreground=THEME["text_muted"])
 
@@ -3020,6 +3140,7 @@ def self_test(report, fsp=None):
     check("Pillow icon", lambda: f"{app_icon_image(64).size}")
     root = None
     try:
+        enable_windows_dpi_awareness()
         root = tk.Tk(className=APP_CLASS)
         check("Tk", lambda: f"Tk {root.tk.call('info', 'patchlevel')}")
         app = FSPGuiApp(root, initial_fsp=fsp)
@@ -3932,17 +4053,17 @@ class AppDialog(tk.Toplevel):
         self.title(title)
         self.resizable(False, False)
         self.transient(root)
-        self.configure(bg=T["panel_bg"], padx=18, pady=16)
+        self.configure(bg=T["panel_bg"], padx=dpx(18), pady=dpx(16))
         top = tk.Frame(self, bg=T["panel_bg"])
         top.pack(anchor=tk.W, fill=tk.X)
         if icon is not None:
             label = tk.Label(top, image=icon, bg=T["panel_bg"])
             label.image = icon  # keep a reference, or Tk shows an empty square
-            label.pack(side=tk.LEFT, anchor=tk.N, padx=(0, 16))
-        tk.Label(top, text=message, justify=tk.LEFT, wraplength=440, font=(FONT_UI, 11),
+            label.pack(side=tk.LEFT, anchor=tk.N, padx=(0, dpx(16)))
+        tk.Label(top, text=message, justify=tk.LEFT, wraplength=tx(440), font=ui_font(11),
                  bg=T["panel_bg"], fg=T["text"]).pack(side=tk.LEFT, anchor=tk.W)
         if checkbox:
-            tk.Checkbutton(self, text=checkbox[0], variable=checkbox[1], font=(FONT_UI, 10),
+            tk.Checkbutton(self, text=checkbox[0], variable=checkbox[1], font=ui_font(10),
                            bg=T["panel_bg"], fg=T["text"], activebackground=T["panel_bg"],
                            activeforeground=T["text"], selectcolor=T["entry_bg"],
                            highlightthickness=0).pack(anchor=tk.W, pady=(14, 0))
@@ -3954,7 +4075,7 @@ class AppDialog(tk.Toplevel):
                                            variant="primary" if i == 0 else "secondary", bold=i == 0)
             self.buttons[key].pack(side=tk.LEFT, padx=(8, 0))
         if note:
-            tk.Label(self, text=note, justify=tk.LEFT, wraplength=480, font=(FONT_UI, 9),
+            tk.Label(self, text=note, justify=tk.LEFT, wraplength=tx(480), font=ui_font(9),
                      bg=T["panel_bg"], fg=T["text_muted"]).pack(anchor=tk.W, pady=(14, 0))
         self.bind("<Return>", lambda event: self._choose(buttons[0][0]))
         self.bind("<Escape>", lambda event: self._choose(None))
@@ -3977,6 +4098,145 @@ class AppDialog(tk.Toplevel):
             pass
         self.wait_window()
         return self.choice
+
+
+class SettingsDialog(AppDialog):
+    """Settings of the program: fonts, font size, interface scale, the layout of the window at the
+    start and the colour map of the colour plots. OK saves them and uses them at once (the interface
+    scale at the next start)."""
+
+    def __init__(self, app):
+        tk.Toplevel.__init__(self, app.root)
+        T = THEME
+        self.app, self.root, self.choice = app, app.root, None
+        self.title("Settings")
+        self.resizable(False, False)
+        self.transient(app.root)
+        self.configure(bg=T["panel_bg"], padx=dpx(20), pady=dpx(16))
+        config = load_config()
+        self.families = sorted({f for f in tkfont.families(app.root) if not f.startswith("@")}, key=str.lower)
+        self.auto_label = f"Automatic ({round(system_ui_scale(app.root) * 100)} %)"
+        self.font_var = tk.StringVar(value=UI["font"])
+        self.mono_var = tk.StringVar(value=UI["mono"])
+        self.size_var = tk.StringVar(value=str(UI["size"]))
+        scale = config.get("ui_scale", "auto")
+        self.scale_var = tk.StringVar(value=self.auto_label if scale == "auto" else f"{scale} %")
+        self.split_plot_var = tk.StringVar(value=str(round(app.layout["split_plot"] * 100)))
+        self.split_editor_var = tk.StringVar(value=str(round(app.layout["split_editor"] * 100)))
+        self.cmap_var = tk.StringVar(value=app.cmap_var.get())
+        self.cmap_reverse_var = tk.BooleanVar(value=app.cmap_reverse_var.get())
+
+        grid = tk.Frame(self, bg=T["panel_bg"])
+        grid.pack(fill=tk.X)
+        self._row = 0
+
+        def section(text):
+            tk.Label(grid, text=text, font=ui_font(11, bold=True), bg=T["panel_bg"], fg=T["text"]).grid(
+                row=self._row, column=0, columnspan=3, sticky="w", pady=(dpx(10) if self._row else 0, dpx(4)))
+            self._row += 1
+
+        def row(label, widget, hint=""):
+            tk.Label(grid, text=label, font=ui_font(10), bg=T["panel_bg"], fg=T["text_muted"]).grid(
+                row=self._row, column=0, sticky="w", padx=(dpx(12), dpx(10)), pady=dpx(3))
+            widget.grid(row=self._row, column=1, sticky="w", pady=dpx(3))
+            if hint:
+                tk.Label(grid, text=hint, font=ui_font(9), bg=T["panel_bg"], fg=T["text_dim"]).grid(
+                    row=self._row, column=2, sticky="w", padx=(dpx(8), 0))
+            self._row += 1
+
+        def combo(var, values, width, readonly=True):
+            return ttk.Combobox(grid, textvariable=var, values=values, width=width, font=ui_font(10),
+                                style="Dark.TCombobox", state="readonly" if readonly else "normal", height=16)
+
+        def spin(var, lo, hi):
+            return ttk.Spinbox(grid, textvariable=var, from_=lo, to=hi, increment=1, width=5, font=ui_font(10),
+                               style="Dark.TSpinbox")
+
+        section("Text")
+        row("Font:", combo(self.font_var, self.families, 28, readonly=False))
+        row("Monospaced font:", combo(self.mono_var, self.families, 28, readonly=False),
+            "parameters, labels in the views")
+        row("Font size:", spin(self.size_var, 6, 24), f"pt (standard: {FONT_SIZE_DEFAULT})")
+
+        section("Window")
+        row("Interface scale:", combo(self.scale_var, [self.auto_label] + [f"{p} %" for p in UI_SCALE_CHOICES], 18),
+            "size of everything; used at the next start")
+        row("Views : results plot:", spin(self.split_plot_var, 20, 80), "% of the width for the views")
+        row("Views : model parameters:", spin(self.split_editor_var, 20, 85), "% of the height for the views")
+        FlatButton(grid, "Use Current Layout", self._use_current_layout, size=9, padx=8, pady=3,
+                   tooltip="Take the divider positions of the window as it is now").grid(
+            row=self._row, column=1, columnspan=2, sticky="w", pady=(dpx(2), 0))
+        self._row += 1
+
+        section("Plots")
+        cmap_row = tk.Frame(grid, bg=T["panel_bg"])
+        combo_cmap = ttk.Combobox(cmap_row, textvariable=self.cmap_var, values=app.colormap_choices(), width=12,
+                                  font=ui_font(10), style="Dark.TCombobox", state="readonly")
+        combo_cmap.pack(side=tk.LEFT)
+        tk.Checkbutton(cmap_row, text="Reverse", variable=self.cmap_reverse_var, font=ui_font(10),
+                       bg=T["panel_bg"], fg=T["text"], activebackground=T["panel_bg"], activeforeground=T["text"],
+                       selectcolor=T["entry_bg"], highlightthickness=0, bd=0).pack(side=tk.LEFT, padx=(dpx(8), 0))
+        row("Colour map:", cmap_row, "of the colour plots (Default: each plot its own)")
+
+        buttons = tk.Frame(self, bg=T["panel_bg"])
+        buttons.pack(fill=tk.X, pady=(dpx(18), 0))
+        FlatButton(buttons, "Restore Defaults", self._restore_defaults).pack(side=tk.LEFT)
+        FlatButton(buttons, "OK", self._ok, variant="primary", bold=True).pack(side=tk.RIGHT, padx=(dpx(8), 0))
+        FlatButton(buttons, "Cancel", lambda: self._choose(None)).pack(side=tk.RIGHT)
+        self.bind("<Return>", lambda event: self._ok())
+        self.bind("<Escape>", lambda event: self._choose(None))
+        self.protocol("WM_DELETE_WINDOW", lambda: self._choose(None))
+
+    def _use_current_layout(self):
+        layout = self.app.current_layout()
+        self.split_plot_var.set(str(round(layout["split_plot"] * 100)))
+        self.split_editor_var.set(str(round(layout["split_editor"] * 100)))
+
+    def _restore_defaults(self):
+        self.font_var.set(FONT_UI)
+        self.mono_var.set(FONT_MONO)
+        self.size_var.set(str(FONT_SIZE_DEFAULT))
+        self.scale_var.set(self.auto_label)
+        self.split_plot_var.set(str(round(LAYOUT_DEFAULTS["split_plot"] * 100)))
+        self.split_editor_var.set(str(round(LAYOUT_DEFAULTS["split_editor"] * 100)))
+        self.cmap_var.set(self.app.COLORMAP_DEFAULT)
+        self.cmap_reverse_var.set(False)
+
+    def _family(self, var, what):
+        """The font family typed or chosen (spelled as the system spells it), or None after a message."""
+        name = var.get().strip()
+        match = next((f for f in self.families if f.lower() == name.lower()), None)
+        if match is None:
+            messagebox.showerror("Settings", f"There is no {what} called “{name}” on this computer.", parent=self)
+        return match
+
+    def values(self):
+        """The settings in the dialog, or None (after a message) if one is not valid."""
+        family = self._family(self.font_var, "font")
+        mono = family and self._family(self.mono_var, "font")
+        if not mono:
+            return None
+        try:
+            size = int(self.size_var.get())
+            split_plot = int(self.split_plot_var.get())
+            split_editor = int(self.split_editor_var.get())
+        except ValueError:
+            messagebox.showerror("Settings", "The font size and the layout are whole numbers.", parent=self)
+            return None
+        scale = self.scale_var.get()
+        return {
+            "font_family": family, "font_mono": mono, "font_size": min(24, max(6, size)),
+            "ui_scale": "auto" if scale == self.auto_label else int(scale.split()[0]),
+            "split_plot": min(80, max(20, split_plot)) / 100, "split_editor": min(85, max(20, split_editor)) / 100,
+            "colormap": self.cmap_var.get(), "colormap_reversed": bool(self.cmap_reverse_var.get()),
+        }
+
+    def _ok(self):
+        values = self.values()
+        if values is None:
+            return
+        self._choose("ok")
+        self.app.apply_settings(values)
 
 
 class FSPGuiApp:
@@ -4014,8 +4274,16 @@ class FSPGuiApp:
                 self.root.iconphoto(True, self.app_icon)
             except tk.TclError:
                 pass
-        self.root.geometry("1640x960")
-        self.root.minsize(1220, 740)
+        config = load_config()
+        init_ui_scale(root, config.get("ui_scale", "auto"))
+        set_fonts(config.get("font_family") or FONT_UI, config.get("font_mono") or FONT_MONO,
+                  self._font_size_setting(config.get("font_size")))
+        self.layout = {key: self._split_setting(config.get(key), default) for key, default in LAYOUT_DEFAULTS.items()}
+        # the window fits on the screen (a laptop with a scaled display has fewer points than the Mac)
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        w, h = min(dpx(1640), int(sw * 0.95)), min(dpx(960), int(sh * 0.88))
+        self.root.geometry(f"{w}x{h}")
+        self.root.minsize(min(dpx(1220), w), min(dpx(740), h))
         self.root.configure(bg=THEME["app_bg"])
         try:
             self.root.tk.call("::tk::unsupported::MacWindowStyle", "appearance", self.root, "darkaqua")
@@ -4031,17 +4299,19 @@ class FSPGuiApp:
         self.popout_canvas: FigureCanvasTkAgg | None = None
         self._busy_depth = 0
         # colour map of the colour (surface) plots, and whether it runs the other way; remembered
-        config = load_config()
-        cmap = config.get("colormap", self.COLORMAP_DEFAULT)
+        cmap =config.get("colormap", self.COLORMAP_DEFAULT)
         self.cmap_var = tk.StringVar(value=cmap if cmap in self.colormap_choices() else self.COLORMAP_DEFAULT)
         self.cmap_reverse_var = tk.BooleanVar(value=bool(config.get("colormap_reversed", False)))
 
         self._build_ui()
         self._build_menu()
+        self.root.after(150, self.apply_layout)  # once the window has its size
 
         if sys.platform == "darwin":  # a .fsp file opened with the installed application in Finder
             try:
                 self.root.createcommand("::tk::mac::OpenDocument", lambda *paths: paths and self.open_fsp_file(paths[0]))
+                # Settings… (Cmd+,) in the application menu, the menu with the name of the program
+                self.root.createcommand("::tk::mac::ShowPreferences", self.show_settings)
             except tk.TclError:
                 pass
         if initial_fsp:  # the file given on the command line
@@ -4060,6 +4330,9 @@ class FSPGuiApp:
         file_menu.add_separator()
         file_menu.add_command(label="Export Plot Data to Clipboard", command=self.export_data_to_clipboard,
                               **({"accelerator": "Cmd+C"} if sys.platform == "darwin" else {}))
+        if sys.platform != "darwin":  # macOS: in the application menu (::tk::mac::ShowPreferences)
+            file_menu.add_separator()
+            file_menu.add_command(label="Settings…", command=self.show_settings, accelerator="Ctrl+,")
         file_menu.add_separator()
         file_menu.add_command(label="Quit", command=self.root.quit, accelerator=f"{mod}+Q")
         menubar.add_cascade(label="File", menu=file_menu)
@@ -4075,6 +4348,8 @@ class FSPGuiApp:
         menubar.add_cascade(label="Help", menu=help_menu)
         self.root.config(menu=menubar)
         self.root.bind_all("<Command-o>" if sys.platform == "darwin" else "<Control-o>", lambda e: self.browse_fsp())
+        if sys.platform != "darwin":
+            self.root.bind_all("<Control-comma>", lambda e: self.show_settings())
         if sys.platform != "darwin":  # macOS has Cmd+Q of its own
             self.root.bind_all("<Control-q>", lambda e: self.root.quit())
 
@@ -4084,18 +4359,23 @@ class FSPGuiApp:
         # ==================================================================
         # Top Control & Toolbar Strip
         # ==================================================================
-        toolbar = tk.Frame(self.root, bg=T["bar_bg"], padx=12, pady=8)
+        toolbar = tk.Frame(self.root, bg=T["bar_bg"], padx=dpx(12), pady=dpx(8))
         toolbar.pack(fill=tk.X, side=tk.TOP)
+        self.toolbar = toolbar
 
-        # App branding + Open buttons
-        tk.Label(
-            toolbar, text="◆", font=(FONT_UI, 16), bg=T["bar_bg"], fg=T["port_yellow"]
-        ).pack(side=tk.LEFT, padx=(0, 6))
-        tk.Label(
-            toolbar, text="FSP Viewer & Plotter", font=(FONT_UI, 13, "bold"), bg=T["bar_bg"], fg=T["text"]
-        ).pack(side=tk.LEFT, padx=(0, 12))
+        # App branding + Open buttons; the branding gives way when the toolbar is too narrow
+        # (a packed row hides its last widgets first: the Port selector)
+        self._brand = [
+            (tk.Label(toolbar, text="◆", font=ui_font(16), bg=T["bar_bg"], fg=T["port_yellow"]), (0, 6)),
+            (tk.Label(toolbar, text="FSP Viewer & Plotter", font=ui_font(13, bold=True), bg=T["bar_bg"],
+                      fg=T["text"]), (0, 12)),
+        ]
+        for label, pad in self._brand:
+            label.pack(side=tk.LEFT, padx=(dpx(pad[0]), dpx(pad[1])))
+        self._brand_shown = True
+        toolbar.bind("<Configure>", lambda e: self.root.after_idle(self._fit_toolbar))
 
-        FlatButton(
+        self.btn_open_fsp = FlatButton(
             toolbar,
             "📂 Open .fsp…",
             self.browse_fsp,
@@ -4105,7 +4385,8 @@ class FSPGuiApp:
             padx=12,
             pady=5,
             tooltip="Open an Ansys Lumerical FDTD project file (.fsp)",
-        ).pack(side=tk.LEFT, padx=(0, 6))
+        )
+        self.btn_open_fsp.pack(side=tk.LEFT, padx=(0, 6))
 
         FlatButton(
             toolbar,
@@ -4168,7 +4449,7 @@ class FSPGuiApp:
             state="readonly",
             width=11,
             style="Dark.TCombobox",
-            font=(FONT_UI, 10),
+            font=ui_font(10),
             values=["Center λ"],
         )
         self.cmb_lam.pack(side=tk.RIGHT, padx=(4, 4))
@@ -4181,15 +4462,15 @@ class FSPGuiApp:
             toolbar,
             textvariable=self.result_var,
             state="readonly",
-            width=32,
+            width=self.RESULT_WIDTH,
             style="Dark.TCombobox",
-            font=(FONT_UI, 10),
+            font=ui_font(10),
             values=self.RESULT_OPTIONS,
         )
         self.cmb_result.pack(side=tk.RIGHT, padx=(4, 4))
         self.cmb_result.bind("<<ComboboxSelected>>", lambda e: self.plot_selected())
         tk.Label(
-            toolbar, text="Result:", font=(FONT_UI, 10, "bold"), bg=T["bar_bg"], fg=T["text_muted"]
+            toolbar, text="Result:", font=ui_font(10, bold=True), bg=T["bar_bg"], fg=T["text_muted"]
         ).pack(side=tk.RIGHT, padx=(8, 2))
 
         # Port dropdown menu
@@ -4200,13 +4481,13 @@ class FSPGuiApp:
             state="readonly",
             width=16,
             style="Dark.TCombobox",
-            font=(FONT_UI, 10),
+            font=ui_font(10),
             values=["All Ports"],
         )
         self.cmb_port.pack(side=tk.RIGHT, padx=(4, 4))
         self.cmb_port.bind("<<ComboboxSelected>>", self._on_port_dropdown_changed)
         tk.Label(
-            toolbar, text="Port:", font=(FONT_UI, 10, "bold"), bg=T["bar_bg"], fg=T["port_yellow"]
+            toolbar, text="Port:", font=ui_font(10, bold=True), bg=T["bar_bg"], fg=T["port_yellow"]
         ).pack(side=tk.RIGHT, padx=(8, 2))
 
         # ==================================================================
@@ -4221,29 +4502,29 @@ class FSPGuiApp:
         statusbar.pack(fill=tk.X, side=tk.BOTTOM)
         tk.Frame(self.root, bg=T["border"], height=1).pack(fill=tk.X, side=tk.BOTTOM)
         self.status_info_lbl = tk.Label(
-            statusbar, text="", font=(FONT_UI, 9), bg=T["bar_bg"], fg=T["text_muted"], anchor="e"
+            statusbar, text="", font=ui_font(9), bg=T["bar_bg"], fg=T["text_muted"], anchor="e"
         )
         self.status_info_lbl.pack(side=tk.RIGHT, padx=(12, 10), pady=2)
         # layers, ports and monitors of the model, and the stretch of the view under the pointer
         # (shown in the headers of the views before, where it hid the pointer position)
         self.status_model_lbl = tk.Label(
-            statusbar, text="", font=(FONT_UI, 9), bg=T["bar_bg"], fg=T["port_yellow"], anchor="e"
+            statusbar, text="", font=ui_font(9), bg=T["bar_bg"], fg=T["port_yellow"], anchor="e"
         )
         self.status_model_lbl.pack(side=tk.RIGHT, padx=(12, 0), pady=2)
         self.status_lbl = tk.Label(
-            statusbar, text="Ready: open an .fsp file", font=(FONT_UI, 9), bg=T["bar_bg"],
+            statusbar, text="Ready: open an .fsp file", font=ui_font(9), bg=T["bar_bg"],
             fg=T["text_muted"], anchor="w"
         )
         self.status_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 0), pady=2)
 
         self.main_paned = tk.PanedWindow(
-            self.root, orient=tk.HORIZONTAL, bg=T["app_bg"], sashwidth=6, bd=0, opaqueresize=True
+            self.root, orient=tk.HORIZONTAL, bg=T["app_bg"], sashwidth=dpx(6), bd=0, opaqueresize=True
         )
-        self.main_paned.pack(fill=tk.BOTH, expand=True, padx=6, pady=(4, 6))
+        self.main_paned.pack(fill=tk.BOTH, expand=True, padx=dpx(6), pady=(dpx(4), dpx(6)))
 
         # Left vertical split (4-View Visualization Field + Parameter Editor)
         self.left_paned = tk.PanedWindow(
-            self.main_paned, orient=tk.VERTICAL, bg=T["app_bg"], sashwidth=6, bd=0, opaqueresize=True
+            self.main_paned, orient=tk.VERTICAL, bg=T["app_bg"], sashwidth=dpx(6), bd=0, opaqueresize=True
         )
 
         # ------------------------------------------------------------------
@@ -4285,8 +4566,8 @@ class FSPGuiApp:
         # ------------------------------------------------------------------
         self.param_editor = ParameterEditorPanel(self.left_paned)
 
-        self.left_paned.add(quad_frame, minsize=360, height=560)
-        self.left_paned.add(self.param_editor, minsize=180, height=320)
+        self.left_paned.add(quad_frame, minsize=dpx(360), height=dpx(560))
+        self.left_paned.add(self.param_editor, minsize=dpx(180), height=dpx(320))
 
         # ------------------------------------------------------------------
         # 3. Fifth Larger Plot Window (Right Pane + Pop-Out Window Button)
@@ -4324,7 +4605,7 @@ class FSPGuiApp:
         tk.Label(
             plot_header,
             text="Results Plot Window (5th Window)",
-            font=(FONT_UI, 11, "bold"),
+            font=ui_font(11, bold=True),
             bg=T["panel_bg"],
             fg=T["text"],
             anchor="w",
@@ -4332,7 +4613,7 @@ class FSPGuiApp:
 
         # Matplotlib Figure & Canvas
         self.fig = Figure(figsize=(7.6, 6.4), dpi=100, facecolor="#12151a")
-        self.mpl_canvas = FigureCanvasTkAgg(self.fig, master=self.plot_panel)
+        self.mpl_canvas = FigureCanvas(self.fig, master=self.plot_panel)
         self.mpl_canvas.get_tk_widget().configure(bg="#12151a", highlightthickness=0)
         self.mpl_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
@@ -4342,8 +4623,8 @@ class FSPGuiApp:
         self.mpl_toolbar.update()
         self.mpl_toolbar.pack(side=tk.LEFT, fill=tk.X)
 
-        self.main_paned.add(self.left_paned, minsize=580, width=860)
-        self.main_paned.add(self.plot_panel, minsize=480, width=760)
+        self.main_paned.add(self.left_paned, minsize=dpx(580), width=dpx(860))
+        self.main_paned.add(self.plot_panel, minsize=dpx(480), width=dpx(760))
 
         self._draw_empty_plot()
 
@@ -4362,15 +4643,15 @@ class FSPGuiApp:
         """The colour map selector and the Reverse check button, in a frame of their own."""
         T = THEME
         frame = tk.Frame(parent, bg=bg)
-        tk.Label(frame, text="Colors:", font=(FONT_UI, 9, "bold"), bg=bg, fg=T["text_muted"]).pack(side=tk.LEFT)
+        tk.Label(frame, text="Colors:", font=ui_font(9, bold=True), bg=bg, fg=T["text_muted"]).pack(side=tk.LEFT)
         cmb = ttk.Combobox(frame, textvariable=self.cmap_var, state="readonly", width=9,
-                           style="Dark.TCombobox", font=(FONT_UI, 9), values=self.colormap_choices())
+                           style="Dark.TCombobox", font=ui_font(9), values=self.colormap_choices())
         cmb.pack(side=tk.LEFT, padx=(4, 4))
         cmb.bind("<<ComboboxSelected>>", lambda e: self._on_colormap_changed())
         Tooltip(cmb, "Colour map of the colour plots (fields, refractive index, propagation).\n"
                      "Default: each plot its own (viridis for n, inferno for |E|², magma for components)")
         chk = tk.Checkbutton(frame, text="Reverse", variable=self.cmap_reverse_var,
-                             command=self._on_colormap_changed, font=(FONT_UI, 9),
+                             command=self._on_colormap_changed, font=ui_font(9),
                              bg=bg, fg=T["text"], activebackground=bg, activeforeground=T["text"],
                              selectcolor=T["entry_bg"], highlightthickness=0, bd=0)
         chk.pack(side=tk.LEFT)
@@ -4406,6 +4687,114 @@ class FSPGuiApp:
                     if default:
                         coll.set_cmap(self._cmap(default))  # its colour bar follows
             canvas.draw_idle()
+
+    # ==================================================================
+    # Layout and Settings
+    # ==================================================================
+    @staticmethod
+    def _font_size_setting(value):
+        try:
+            return min(24, max(6, int(value)))
+        except (TypeError, ValueError):
+            return FONT_SIZE_DEFAULT
+
+    @staticmethod
+    def _split_setting(value, default):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return default
+        return value if 0.15 <= value <= 0.85 else default
+
+    RESULT_WIDTH, RESULT_WIDTH_NARROW = 32, 22  # characters of the Result selector (narrow: tight toolbar)
+
+    def _fit_toolbar(self):
+        """When the controls of the toolbar do not fit, first hide the branding, then narrow the
+        Result selector; undo it when there is room again."""
+        try:
+            width, need = self.toolbar.winfo_width(), self.toolbar.winfo_reqwidth()
+        except tk.TclError:
+            return
+        if width <= 1:
+            return
+        brand = sum(label.winfo_reqwidth() + dpx(pad[0] + pad[1]) for label, pad in self._brand)
+        result = (self.RESULT_WIDTH - self.RESULT_WIDTH_NARROW) * ui_font(10).measure("0")
+        narrowed = int(str(self.cmb_result.cget("width"))) < self.RESULT_WIDTH
+        full = need + (0 if self._brand_shown else brand) + (result if narrowed else 0)
+        show_brand, narrow = full <= width, full - brand > width
+        if show_brand != self._brand_shown:
+            for label, pad in self._brand:
+                if show_brand:
+                    label.pack(side=tk.LEFT, padx=(dpx(pad[0]), dpx(pad[1])), before=self.btn_open_fsp)
+                else:
+                    label.pack_forget()
+            self._brand_shown = show_brand
+        if narrow != narrowed:
+            self.cmb_result.configure(width=self.RESULT_WIDTH_NARROW if narrow else self.RESULT_WIDTH)
+
+    def apply_layout(self):
+        """Put the dividers between the views, the parameters and the results plot where the
+        settings say."""
+        try:
+            self.root.update_idletasks()
+            w, h = self.main_paned.winfo_width(), self.left_paned.winfo_height()
+            if w > 50:
+                self.main_paned.sash_place(0, int(w * self.layout["split_plot"]), 0)
+            if h > 50:
+                self.left_paned.sash_place(0, 0, int(h * self.layout["split_editor"]))
+        except tk.TclError:
+            pass
+
+    def current_layout(self):
+        """Where the dividers are now, as fractions of the width and the height."""
+        layout = dict(self.layout)
+        try:
+            w, h = self.main_paned.winfo_width(), self.left_paned.winfo_height()
+            if w > 50:
+                layout["split_plot"] = self.main_paned.sash_coord(0)[0] / w
+            if h > 50:
+                layout["split_editor"] = self.left_paned.sash_coord(0)[1] / h
+        except tk.TclError:
+            pass
+        return layout
+
+    def show_settings(self):
+        """File > Settings (macOS: FSP Viewer > Settings): fonts, interface scale, layout, colour map."""
+        if getattr(self, "_settings", None) is not None and self._settings.winfo_exists():
+            self._settings.lift()
+            return
+        self._settings = SettingsDialog(self)
+        self._settings.show()
+        self._settings = None
+
+    def apply_settings(self, values):
+        """Save and use the settings of the Settings dialog (a dict, see SettingsDialog.values)."""
+        config = load_config()
+        old_scale = config.get("ui_scale", "auto")
+        config.update({
+            "font_family": values["font_family"], "font_mono": values["font_mono"],
+            "font_size": values["font_size"], "ui_scale": values["ui_scale"],
+            "split_plot": round(values["split_plot"], 3), "split_editor": round(values["split_editor"], 3),
+        })
+        save_config(config)
+        # fonts: every widget and canvas text follows its named font; the views redraw their margins
+        set_fonts(values["font_family"], values["font_mono"], values["font_size"])
+        for view in (self.view_xy, self.view_xz, self.view_yz, self.view_3d):
+            view.redraw()
+        self.layout = {"split_plot": values["split_plot"], "split_editor": values["split_editor"]}
+        self.apply_layout()
+        self.root.after_idle(self._fit_toolbar)
+        self.cmap_var.set(values["colormap"])
+        self.cmap_reverse_var.set(values["colormap_reversed"])
+        self._on_colormap_changed()  # saves them, and recolours the plots
+        if str(values["ui_scale"]) != str(old_scale):
+            choice = self.message(
+                "Interface Scale",
+                f"The new interface scale is used the next time {APP_NAME} starts.\n\nRestart now? "
+                "The file that is open now is opened again.",
+                [("restart", "Restart Now"), ("later", "Later")])
+            if choice == "restart":
+                self.restart(THIS_SCRIPT)
 
     # ==================================================================
     # Status Bar
@@ -4654,7 +5043,8 @@ class FSPGuiApp:
 
         win = tk.Toplevel(self.root)
         win.title(f"{APP_NAME} — Fifth Plot Window")
-        win.geometry("1080x760")
+        win.geometry(f"{min(dpx(1080), int(self.root.winfo_screenwidth() * 0.9))}x"
+                     f"{min(dpx(760), int(self.root.winfo_screenheight() * 0.85))}")
         win.configure(bg=THEME["panel_bg"])
         self.popout_win = win
 
@@ -4663,7 +5053,7 @@ class FSPGuiApp:
         tk.Label(
             top,
             textvariable=self.result_var,
-            font=(FONT_UI, 12, "bold"),
+            font=ui_font(12, bold=True),
             bg=THEME["bar_bg"],
             fg=THEME["text"],
         ).pack(side=tk.LEFT, padx=6)
@@ -4680,7 +5070,7 @@ class FSPGuiApp:
         self._build_colormap_controls(top, THEME["bar_bg"]).pack(side=tk.RIGHT, padx=6)
 
         self.popout_fig = Figure(figsize=(10.2, 6.8), dpi=100, facecolor="#12151a")
-        self.popout_canvas = FigureCanvasTkAgg(self.popout_fig, master=win)
+        self.popout_canvas = FigureCanvas(self.popout_fig, master=win)
         self.popout_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
         tb_frame = tk.Frame(win, bg=THEME["bar_bg"])
@@ -6000,6 +6390,7 @@ def main(argv=None):
     except OSError:
         pass
     set_macos_app_name(APP_NAME)
+    enable_windows_dpi_awareness()  # sharp text on scaled displays (the program scales itself)
     root = tk.Tk(className=APP_CLASS)
     app = FSPGuiApp(root, initial_fsp=fsp_arg, initial_h5=h5_arg)
     root.after(100, lambda: bring_to_front(root))

@@ -179,8 +179,21 @@ python fsp_export.py model.fsp model_geometry.py    # gdsfactory script
 ```
 
 ### Menus
-- **File**: Open .fsp File…, Open .h5 Field File…, Save Geometry as GDS File…, Save Geometry as Python (gdsfactory) Script…, Export Plot Data to Clipboard, Quit.
+- **File**: Open .fsp File…, Open .h5 Field File…, Save Geometry as GDS File…, Save Geometry as Python (gdsfactory) Script…, Export Plot Data to Clipboard, Settings… (Ctrl+,; on macOS in the **FSP Viewer** menu, Cmd+,), Quit.
 - **Help**: About FSP Viewer, Check for Updates…, Install FSP Viewer…, Uninstall…, GitHub Page.
+
+### Settings
+**Settings…** opens the settings of the viewer; **OK** saves them in `~/.fsp_viewer.json` and uses them at once:
+
+| Setting | What it does |
+| :--- | :--- |
+| **Font**, **Monospaced font** | The font of the window, and the one of the parameter editor and the labels in the views |
+| **Font size** | Size of the normal text (standard: 10 pt); all text follows it |
+| **Interface scale** | Size of everything (text, gaps, plots). *Automatic* follows the display scaling of Windows and Linux (e.g. 150 %); macOS scales by itself. Used at the next start |
+| **Views : results plot**, **Views : model parameters** | Where the dividers of the window are at the start; **Use Current Layout** takes them from the window |
+| **Colour map**, **Reverse** | The colour map of the colour plots (also chosen with **Colors** in the plot panel) |
+
+The sizes of the window are designed in pixels of a Mac, where a point of a font is a pixel. Windows counts 96 pixels per inch instead of 72 (and more on a scaled display), so there the viewer gives its fonts in pixels and multiplies its gaps and margins by the interface scale: the window keeps the proportions it has on the Mac. It also tells Windows that it scales itself, so a scaled display shows sharp text instead of a stretched picture of the window. When the toolbar is too narrow, the *FSP Viewer & Plotter* title and then the width of the **Result** selector give way, so the **Port** selector stays visible.
 
 ### Configuration
 The parameters at the top of `fsp_gui.py`:
