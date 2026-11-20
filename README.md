@@ -2,7 +2,7 @@
 
 <img src="icon.png" width="96" alt="FSP Viewer icon: a black square on a yellow background">
 
-**Version 0.2.5** — see [Version History](#version-history).
+**Version 0.2.7** — see [Version History](#version-history).
 
 View Ansys Lumerical FDTD project files (`.fsp`), plot their results and save their geometry as GDS **without a Lumerical license** — as a ready-to-run application that needs no Python, for Windows, macOS and Linux (see [Download](#download)), or as a Python program on any system.
 
@@ -112,8 +112,8 @@ So a new `fsp_gui.py` pushed to GitHub reaches the Python copies at once, and th
 | **Open .fsp…** (Ctrl/Cmd+O) | Open a Lumerical FDTD project |
 | **Open .h5…** | Load or switch the monitor field file of the project |
 | **Save Geometry ▾** | Save the displayed structures as a GDS file or as a gdsfactory script (see below) |
-| **Port** | The port (or stand-alone mode monitor) the plots refer to; *All Ports* shows several side by side. It is also highlighted in the four views |
-| **Result** | What to plot (see *Result plots*) |
+| **Object** | The port, monitor or `FDTD::ports` (the S-parameters) whose results are listed, named as in the model; *All objects* lists only the analyses of the whole model. A click on a port or monitor in the views selects it; it is highlighted in the four views |
+| **Result** | The results of the object that the open files hold or that can be calculated from them, then the analyses of the whole model (see *Result plots*) |
 | **λ** | The wavelength of single-wavelength field plots, from the frequencies of the monitors |
 | **Plot** | Draw the selected result |
 | **Export Data** | Copy the numbers of the current plot to the clipboard as a tab-separated table (for a spreadsheet) |
@@ -143,23 +143,27 @@ A read-only inspector with line numbers and syntax colours:
 ### Result plots
 The plot is drawn in the large panel on the right, with the matplotlib toolbar (zoom, pan, save as image); **↗ Separate Window** opens it in a window of its own. **Colors** chooses the colour map of the colour plots (fields, refractive index, XZ propagation): *Default* keeps each plot's own (viridis for n, inferno for \|E\|², magma for the field components), or plasma, viridis, inferno, magma, cividis, turbo, jet, Spectral, rainbow, hot, coolwarm, RdBu, bone, gray; **Reverse** runs the scale the other way. The plot is recoloured without being computed again, and the choice is remembered.
 
-| Result | Needs `.h5` | What it shows |
-| :--- | :---: | :--- |
-| Cross-Sections & Port Modes (n & \|E\|²) | | Refractive index and mode profile stored for each port, with the effective index |
-| Stored Port Mode \|E\|² Profile (YZ) | | The mode of the selected port |
-| Stored Refractive Index n(y, z) (YZ) | | The index cross-section at the port |
-| Simulated Field \|E\|² in YZ Planes | ✓ or in `.fsp` | The simulated field in the port and field-monitor planes at the chosen wavelength |
-| Power Through YZ Planes vs x & λ | ✓ or in `.fsp` | Power through the port and monitor planes along the device, relative to the first one, and its spectrum |
-| Power Spectrum at Selected Plane | ✓ or in `.fsp` | P / P_source of the selected port or monitor (all of them with *All Ports*) against λ, linear and dB (fields from an `.h5` file: P / P(first plane at the source), see below); dashed: the part in the stored mode of that plane (a port's own mode, or a mode expansion monitor at the same x) |
-| S-Parameters from Power | ✓ or in `.fsp` | \|S_i1\|² = P_i / P_source of every plane, the mode-resolved \|S_i1\|², and \|S11\|² ≈ 1 − P(first plane after the source) / P_source (not for fields from an `.h5` file); magnitudes only (phases are not in the powers) |
-| Power & Mode Coupling vs. Port x | ✓ | Power through each port and its overlap with the port mode |
-| Port Transmission vs. Wavelength λ | ✓ | Transmission spectrum of the ports |
-| XZ Propagation \|E\|² at y=0 (dB) | ✓ | The field along the device |
-| Top-View Layout & Taper Zoom (XY) | | The layout, and the same with y stretched |
-| Port Mode Field Components | | \|Ex\| … \|Hz\| of the stored mode |
-| Source Time Signal & Spectrum | | The pulse of the source |
+The **Result** list is made for the open files: it lists what the selected object has, named as Lumerical names it (`getresult`), and marks where each result comes from — **[fsp]** stored in the `.fsp`, **[h5]** stored in the `.h5` field file, **[calc]** calculated by the viewer from them. Lumerical does not store `P`, `T`, the mode expansions or `S`: it calculates them from the fields when asked, and so does the viewer (a `power` result stored with a monitor is used as it is).
 
-Besides the ports, the frequency-domain field monitors in y-z planes (e.g. `yz_input`, `yz_half_out`, … along a taper) are shown in cyan in the views and can be chosen in the **Port** list. Their fields are read from the `.h5` file or, when the project stores them itself, from the `.fsp`.
+| Object | Result | What it shows |
+| :--- | :--- | :--- |
+| port, field monitor (y-z plane) | **E**, **H** | \|E\|² (\|H\|²) and its components in the plane at the chosen λ, zoomed to the field, with the material outlines of the port at that x |
+| | **P** | The Poynting vector Px, Py, Pz in the plane |
+| | **T** | Transmission T = P / P_source against λ, linear and dB; dashed: the part in each stored mode of the port at that x. Fields from an `.h5` file are normalised to the source spectrum and the stored `P0` is not, so there T = P / P(port at the source), the injected power |
+| port | **expansion for port monitor** | T_forward (towards +x) and T_backward (towards −x) of each stored port mode: the recorded field expanded on the modes |
+| field monitor at the x of a port | **expansion on the modes of …** | The same with the modes of that port |
+| port, mode expansion monitor | **mode profiles** | The refractive index and \|E\|² of each stored mode, with n_eff; or \|Ex\| … \|Hz\| of each mode |
+| source port | **time_signal, P0** | The stored pulse of the source and its stored power spectrum |
+| `FDTD::ports` | **S** | \|S_i1\|² of every port mode, from the port mode expansions: the power leaving through each port in each mode over the power the source injects (magnitudes; the mode phases are not stored) |
+| other 2D monitors (x-y, x-z planes) | **E**, **H** | \|E\|² (\|H\|²) along the device in dB and linear, with the ports and field monitors marked (the components the monitor recorded) |
+| *whole model* | **All planes — T along x and vs λ** | T through every port and field-monitor plane along the device at λ (open diamonds: the part in mode 1 of the port at that x), and their spectra |
+| | **All planes — E** | \|E\|² in up to eight planes side by side |
+| | **All planes — \|S_i1\|² from their power** | P_i / P_source of every plane in dB, and the part in the stored mode |
+| | **All ports — mode profiles**, **Top view**, **Source** | The modes of all ports; the layout with the FDTD region and ports; the source pulse |
+
+Every port and monitor keeps its own list of frequencies — Lumerical spaces the port frequencies evenly in frequency and the monitor frequencies (by default) evenly in wavelength, in the opposite order — so a field is always taken at the chosen frequency, not at the same place in the list (the plot titles give the exact wavelength). The H of an `.h5` field file is written multiplied by Z0; the viewer finds this from the ratio of E to H and divides it out where absolute units matter (the mode expansion).
+
+Besides the ports, the frequency-domain field monitors in y-z planes (e.g. `yz_input`, `yz_half_out`, … along a taper) are shown in cyan in the views and can be chosen in the **Object** list. Their fields are read from the `.h5` file or, when the project stores them itself, from the `.fsp`.
 
 Large projects (many GB of field results) are not read into memory: the file is memory-mapped, and a result is read when a plot needs it — a field at one wavelength is read alone, not the whole spectrum.
 
@@ -193,7 +197,7 @@ python fsp_export.py model.fsp model_geometry.py    # gdsfactory script
 | **Views : results plot**, **Views : model parameters** | Where the dividers of the window are at the start; **Use Current Layout** takes them from the window |
 | **Colour map**, **Reverse** | The colour map of the colour plots (also chosen with **Colors** in the plot panel) |
 
-The sizes of the window are designed in pixels of a Mac, where a point of a font is a pixel. Windows counts 96 pixels per inch instead of 72 (and more on a scaled display), so there the viewer gives its fonts in pixels and multiplies its gaps and margins by the interface scale: the window keeps the proportions it has on the Mac. It also tells Windows that it scales itself, so a scaled display shows sharp text instead of a stretched picture of the window. When the toolbar is too narrow, the *FSP Viewer & Plotter* title and then the width of the **Result** selector give way, so the **Port** selector stays visible.
+The sizes of the window are designed in pixels of a Mac, where a point of a font is a pixel. Windows counts 96 pixels per inch instead of 72 (and more on a scaled display), so there the viewer gives its fonts in pixels and multiplies its gaps and margins by the interface scale: the window keeps the proportions it has on the Mac. It also tells Windows that it scales itself, so a scaled display shows sharp text instead of a stretched picture of the window. When the toolbar is too narrow, the *FSP Viewer & Plotter* title and then the width of the **Result** selector give way, so the **Object** selector stays visible.
 
 ### Configuration
 The parameters at the top of `fsp_gui.py`:
@@ -201,7 +205,7 @@ The parameters at the top of `fsp_gui.py`:
 | Parameter | Default | Meaning |
 | :--- | :--- | :--- |
 | `APP_NAME` | `"FSP Viewer"` | Window title and name of the installed application |
-| `APP_VERSION` | `"0.2.5"` | Version number; decides whether a copy on GitHub is newer (for the applications: the version tag of the release) |
+| `APP_VERSION` | `"0.2.7"` | Version number; decides whether a copy on GitHub is newer (for the applications: the version tag of the release) |
 | `APP_ICON_YELLOW`, `APP_ICON_BLACK` | `"#ffd700"`, `"#000000"` | Colours of the icon |
 | `APP_ICON_SQUARE` | `0.5` | Side of the black square, as a fraction of the yellow field |
 | `APP_ICON_MARGIN` | `0.1` | Transparent margin on each side, as a fraction of the icon size |
@@ -236,7 +240,7 @@ The release files of [Download](#download) are FSP Viewer packed with Python and
 
 The **Help > Install / Uninstall** menu items of the Python program are not shown in the applications: they are installed and removed as above.
 
-**How they are built.** The GitHub Actions workflow `.github/workflows/release.yml` runs `build_app.py` on GitHub's Windows, macOS (Apple silicon and Intel) and Linux machines whenever a version tag is pushed (`git tag v0.2.5 && git push origin v0.2.5`; the tag must match `APP_VERSION`). On each, `build_app.py` packs the program with PyInstaller (with icon and version information), starts the packed program in a self-test (every library present, the window opens) and makes the packages; on Windows and macOS it also updates a copy of the program from the new package, the way the program does it. On Linux the workflow installs the `.deb` and starts the installed program, and does the same with the `.rpm` on Fedora. When everything has passed, it makes the release of the tag with the packages and the notes of this version from the [Version History](#version-history). Started by hand (*Actions > Release build > Run workflow*) it only keeps the packages as downloads of the run. To build on your own computer (the packages of that system):
+**How they are built.** The GitHub Actions workflow `.github/workflows/release.yml` runs `build_app.py` on GitHub's Windows, macOS (Apple silicon and Intel) and Linux machines whenever a version tag is pushed (`git tag v0.2.7 && git push origin v0.2.7`; the tag must match `APP_VERSION`). On each, `build_app.py` packs the program with PyInstaller (with icon and version information), starts the packed program in a self-test (every library present, the window opens) and makes the packages; on Windows and macOS it also updates a copy of the program from the new package, the way the program does it. On Linux the workflow installs the `.deb` and starts the installed program, and does the same with the `.rpm` on Fedora. When everything has passed, it makes the release of the tag with the packages and the notes of this version from the [Version History](#version-history). Started by hand (*Actions > Release build > Run workflow*) it only keeps the packages as downloads of the run. To build on your own computer (the packages of that system):
 
 ```bash
 python -m pip install -r requirements-build.txt
@@ -315,6 +319,18 @@ Nodes tagged `1000` (structures and layer-builder internals) start with a partly
 ---
 
 ## Version History
+
+### 0.2.7 — 2026-11-20
+- **The Result list is made for the open files**: an **Object** selector (ports, `FDTD::ports`, field monitors, mode expansion monitors and the monitors along the device, e.g. `xz`, `xy_si`) replaces the Port selector, and the **Result** list shows what the object has, named as in Lumerical (`E`, `H`, `P`, `T`, `expansion for port monitor`, `mode profiles`, `S`, and the stored `time_signal`, `P0`), each marked [fsp], [h5] or [calc]; below them the analyses of the whole model.
+- **New results**: the Poynting vector in a plane; the expansion of the recorded field on each stored port mode (T_forward, T_backward); the S-parameters of the port modes (`FDTD::ports` › S); \|E\|² and \|H\|² of any monitor along the device; the mode profiles of every stored mode.
+- **Fix: the spectra of the field monitors were reversed.** Ports and monitors keep their own frequency lists (ports evenly in frequency, monitors evenly in wavelength, in the opposite order); the fields of the monitors were read by position in the port's list, so their spectra were drawn back to front and normalised at the wrong wavelength. Each field is now taken at its own frequency.
+- **Fix: the second stored port mode was shown** (e.g. TM0 with the n_eff of TE0) when a port stores several modes; every stored mode is now shown under its own number and n_eff.
+- **Fix: the H of an `.h5` field file is Z0·H**: found from the ratio of E to H and divided out for the mode expansion.
+- Field and mode plots open zoomed to the field.
+
+### 0.2.6 — 2026-11-20
+- **Settings** (File > Settings…, on macOS in the FSP Viewer menu): fonts, font size, interface scale, the split of the window at the start, and the colour map.
+- **Windows**: sharp text on scaled displays (the program declares that it scales itself), and text in the proportions it has on the Mac; the toolbar hides its title and narrows the Result selector before the Port selector is pushed out of the window.
 
 ### 0.2.5 — 2026-11-19
 - **Applications for every system** in each release, without Python: the Windows `.zip`, a macOS `.dmg` (Apple silicon and Intel) and Linux `.deb` and `.rpm` packages (`/opt/fsp-viewer`, menu entry, `.fsp` file type, the command `fsp-viewer`). `build_app.py` replaces `build_windows.py`; the workflow `.github/workflows/release.yml` builds, tests and publishes them all.

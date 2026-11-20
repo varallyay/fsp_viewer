@@ -87,7 +87,7 @@ os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 # Application parameters - edit these to customise the app
 # ======================================================================
 APP_NAME = "FSP Viewer"         # Window title, name of the installed application and (macOS) menu-bar name
-APP_VERSION = "0.2.5"           # See the version history in README.md
+APP_VERSION = "0.2.7"           # See the version history in README.md
 APP_DESCRIPTION = "Lumerical FSP 3D Viewer & Results Analyzer"
 APP_SLUG = "fsp_viewer"         # Folder and file names of the installation
 APP_CLASS = "Fsp_viewer"        # Window class (Linux: connects the windows to the menu entry)
@@ -109,6 +109,8 @@ UPDATE_CHECK_DAYS = 7           # Look for a new version this often (days); 0 = 
 UPDATE_BRANCH = "HEAD"          # Python copies update from this branch (HEAD: the main branch); applications from releases
 
 __version__ = APP_VERSION
+
+Z0 = 376.730313668  # impedance of free space (ohm)
 
 # Trapezoidal integration helper (NumPy 1.x / 2.x compatible, as in fsp_plots.py)
 TRAPZ = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
@@ -135,6 +137,7 @@ FONT_SIZE_DEFAULT = 10      # size of the normal text (pt); the settings can cha
 UI_SCALE_CHOICES = (100, 125, 150, 175, 200)   # interface scales (%) offered besides "Automatic"
 LAYOUT_DEFAULTS = {"split_plot": 0.53,     # width of the views (and the parameters) : the whole width
                    "split_editor": 0.64}   # height of the four views : the left side
+ALL_OBJECTS = "All objects"  # the choice of the Object selector for the analyses of the whole model
 UI_SCALE = 1.0              # set by init_ui_scale() when the main window opens
 UI = {"font": FONT_UI, "mono": FONT_MONO, "size": FONT_SIZE_DEFAULT}
 _FONTS = {}                 # the named fonts made by ui_font(): (size, weight, mono) -> tkinter.font.Font
@@ -778,8 +781,11 @@ class FSPModelData:
         self.h5_path = os.path.abspath(h5_path)
         self.h5 = h5py.File(self.h5_path, "r")
         self._power_cache = None
-        for cache in ("_h5_cache", "_h5_group_x", "_power_spectra", "_mode_spectra", "_power_ref"):  # results of the previous file
+        for cache in ("_h5_cache", "_h5_group_x", "_power_spectra", "_power_ref", "_expansions",
+                      "_h_scale"):  # results of the previous file
             self.__dict__.pop(cache, None)
+        if hasattr(self, "ports"):  # an .h5 opened later: which monitors have a field now
+            self.field_monitors = self._extract_field_monitors()
 
     def _extract_fdtd_box(self):
         try:
@@ -948,6 +954,9 @@ class FSPModelData:
         return mons
 
     # ---------- fields in y-z planes (ports and field monitors), from the .h5 or the .fsp ----------
+    # Every port and monitor keeps its own list of frequencies: Lumerical spaces those of the ports
+    # evenly in frequency, and those of the monitors (by default) evenly in wavelength, in the
+    # other order. A field is therefore looked up by frequency, never by its position in the list.
     def plane_source(self, name):
         """Where the recorded field of a port or field monitor is: ("h5", group), ("fsp", object) or None.
         Fields stored in the .fsp are read one frequency at a time, never as a whole."""
@@ -983,6 +992,37 @@ class FSPModelData:
         planes = [pl for pl in list(self.ports) + list(self.field_monitors) if self.plane_source(pl["name"])]
         return [pl["name"] for pl in sorted(planes, key=lambda pl: pl["x"])]
 
+    def plane_object(self, name):
+        """The .fsp object of a port (its DFT monitor) or field monitor."""
+        for pl in list(self.ports) + list(self.field_monitors):
+            if pl["name"] == name:
+                return pl.get("dft_obj") if "dft_obj" in pl else pl.get("obj")
+        return None
+
+    @staticmethod
+    def object_freqs(ob):
+        """The frequencies (Hz) an object recorded at, from its own 'f' result; None if it has none."""
+        if ob is None or "f" not in ob.results:
+            return None
+        f = np.ravel(ob.results["f"]).real
+        return f if f.size else None
+
+    def plane_freqs(self, name):
+        f = self.object_freqs(self.plane_object(name))
+        return f if f is not None else self.get_frequencies_and_wavelengths()[0]
+
+    def freq_index(self, f_own, k):
+        """Index in the list f_own of the frequency nearest to the k-th frequency of the model."""
+        freqs = self.get_frequencies_and_wavelengths()[0]
+        return int(np.argmin(np.abs(np.asarray(f_own) - freqs[min(k, len(freqs) - 1)])))
+
+    def plane_k(self, name, k):
+        return self.freq_index(self.plane_freqs(name), k)
+
+    def plane_wavelength(self, name, k):
+        """The wavelength (nm) of the plane's own frequency that is used for the model's k-th one."""
+        return C0 / self.plane_freqs(name)[self.plane_k(name, k)] * 1e9
+
     def plane_grid(self, name):
         """(x, y, z) of the field samples of a port / field monitor, in um."""
         kind, src = self.plane_source(name)
@@ -994,58 +1034,57 @@ class FSPModelData:
         r = src.results
         return float(np.ravel(r["x"])[0]) * 1e6, np.ravel(r["y"]) * 1e6, np.ravel(r["z"]) * 1e6
 
-    def _plane_freq_index(self, ob, k):
-        """Index in the monitor's own frequency list of the k-th frequency of the model."""
-        if "f" not in ob.results:
-            return k
-        f_mon = np.ravel(ob.results["f"]).real
-        freqs, _, _ = self.get_frequencies_and_wavelengths()
-        if len(f_mon) == len(freqs):
-            return k
-        return int(np.argmin(np.abs(f_mon - freqs[min(k, len(freqs) - 1)])))
-
     def plane_has(self, name, comp):
         kind, src = self.plane_source(name)
         return comp in (self.h5[src] if kind == "h5" else src.results)
 
-    def plane_field(self, name, comp, k):
-        """Complex field component `comp` (Ex .. Hz) of a port / field monitor at frequency index k,
-        as an (Nz, Ny) array."""
+    def _plane_field_own(self, name, comp, kk):
+        """Complex field component of a plane at index kk of its own frequency list, as (Nz, Ny)."""
         kind, src = self.plane_source(name)
         if kind == "h5":
-            return self.h5_field(src, comp, k)[:, :, 0]
-        a = src.results.take_last(comp, self._plane_freq_index(src, k))  # (1, Ny, Nz)
-        return np.asarray(a)[0].T
+            return self.h5_field(src, comp, kk)[:, :, 0]
+        return np.asarray(src.results.take_last(comp, kk))[0].T  # (1, Ny, Nz)
 
-    def plane_power(self, name, k):
-        """Power through a port / field monitor plane at frequency index k: the 'power' result
-        Lumerical stored with the monitor, else the Poynting flux of the stored fields; or None."""
-        kind, src = self.plane_source(name)
-        if kind == "fsp" and "power" in src.results:
-            pw = np.ravel(src.results["power"])
-            return float(pw[self._plane_freq_index(src, k)].real)
-        if not all(self.plane_has(name, c) for c in ("Ey", "Ez", "Hy", "Hz")):
-            return None
+    def plane_field(self, name, comp, k):
+        """Complex field component `comp` (Ex .. Hz) of a port / field monitor at the model's
+        frequency k (the nearest of its own), as an (Nz, Ny) array."""
+        return self._plane_field_own(name, comp, self.plane_k(name, k))
+
+    def _plane_power_own(self, name, kk):
         _, y, z = self.plane_grid(name)
-        E = {c: self.plane_field(name, c, k) for c in ("Ey", "Ez", "Hy", "Hz")}
+        E = {c: self._plane_field_own(name, c, kk) for c in ("Ey", "Ez", "Hy", "Hz")}
         sx = np.real(E["Ey"] * np.conj(E["Hz"]) - E["Ez"] * np.conj(E["Hy"]))
         return float(TRAPZ(TRAPZ(sx, y, axis=1), z, axis=0))
 
+    def plane_power(self, name, k):
+        """Power through a port / field monitor plane at the model's frequency k: the 'power' result
+        Lumerical stored with the monitor, else the Poynting flux of the stored fields; or None.
+        (In the units of the stored fields: only ratios of powers are meaningful.)"""
+        kind, src = self.plane_source(name)
+        kk = self.plane_k(name, k)
+        if kind == "fsp" and "power" in src.results:
+            return float(np.ravel(src.results["power"])[kk].real)
+        if not all(self.plane_has(name, c) for c in ("Ey", "Ez", "Hy", "Hz")):
+            return None
+        return self._plane_power_own(name, kk)
+
     SPECTRUM_POINTS = 126  # frequencies evaluated when a spectrum is computed from the fields
 
-    def _spectrum_indices(self):
-        """Frequency indices used for spectra computed from the fields (at most SPECTRUM_POINTS;
-        the rest is interpolated, the spectra being smooth)."""
-        freqs, _, _ = self.get_frequencies_and_wavelengths()
-        n = len(freqs)
+    def _own_indices(self, name):
+        """Indices of the plane's own frequencies used for a spectrum (at most SPECTRUM_POINTS; the
+        rest is interpolated, the spectra being smooth)."""
+        n = len(self.plane_freqs(name))
         return np.arange(n) if n <= self.SPECTRUM_POINTS else np.unique(
             np.linspace(0, n - 1, self.SPECTRUM_POINTS).round().astype(int))
 
-    def _fill_spectrum(self, ks, vals):
-        freqs, _, _ = self.get_frequencies_and_wavelengths()
-        if len(ks) == len(freqs):
-            return np.asarray(vals, float)
-        return np.interp(np.arange(len(freqs)), ks, vals)
+    def _on_model_freqs(self, f_own, values):
+        """Values given at the frequencies f_own, interpolated to every frequency of the model."""
+        freqs = self.get_frequencies_and_wavelengths()[0]
+        f_own, values = np.asarray(f_own, float), np.asarray(values, float)
+        if f_own.size == 1:
+            return np.full(len(freqs), values[0])
+        order = np.argsort(f_own)
+        return np.interp(freqs, f_own[order], values[order])
 
     def source_power(self):
         """Power injected by the (enabled) source at every frequency of the model, as Lumerical's
@@ -1103,13 +1142,14 @@ class FSPModelData:
     def power_reference(self):
         """(spectrum, label, absolute) the plane powers are divided by: the source power, or, when
         the recorded fields are on another scale than the source power (the fields of an .h5 field
-        file carry no absolute normalisation), the power through the first plane at or after the
-        source. None if neither is there."""
+        file are normalised to the source spectrum, the stored P0 is not), the power through the
+        first plane at or after the source (the injected power, less the tiny reflected part).
+        None if neither is there."""
         if getattr(self, "_power_ref", False) is not False:
             return self._power_ref
         self._power_ref = None
         planes = self.field_planes()
-        src = next((pt for pt in self.ports if pt.get("is_source") and pt["enabled"]), None)
+        src = self.source_port()
         x_src = src["x"] if src else None
         first = next((n for n in planes if x_src is None or self.plane_grid(n)[0] >= x_src - 0.01), None)
         p_first = self.plane_power_spectrum(first) if first else None
@@ -1126,6 +1166,9 @@ class FSPModelData:
             self._power_ref = (p_first, f"P({first})", False)
         return self._power_ref
 
+    def source_port(self):
+        return next((pt for pt in self.ports if pt.get("is_source") and pt["enabled"]), None)
+
     def plane_power_spectrum(self, name):
         """Power through a plane at every frequency of the model: the stored 'power' result, else
         the Poynting flux of the recorded fields (needs E and H). None if neither is there."""
@@ -1134,82 +1177,183 @@ class FSPModelData:
             return cache[name]
         out = None
         src = self.plane_source(name)
-        freqs, _, _ = self.get_frequencies_and_wavelengths()
+        f_own = self.plane_freqs(name)
         if src and src[0] == "fsp" and "power" in src[1].results:
             pw = np.ravel(src[1].results["power"]).real
-            if len(pw) == len(freqs):
-                out = pw
-            elif "f" in src[1].results and len(np.ravel(src[1].results["f"])) == len(pw):
-                f_mon = np.ravel(src[1].results["f"]).real
-                order = np.argsort(f_mon)
-                out = np.interp(freqs, f_mon[order], pw[order])
+            if len(pw) == len(f_own):
+                out = self._on_model_freqs(f_own, pw)
         elif src and all(self.plane_has(name, c) for c in ("Ey", "Ez", "Hy", "Hz")):
-            ks = self._spectrum_indices()
-            out = self._fill_spectrum(ks, [self.plane_power(name, int(k)) for k in ks])
+            ks = self._own_indices(name)
+            out = self._on_model_freqs(f_own[ks], [self._plane_power_own(name, int(kk)) for kk in ks])
         cache[name] = out
         return out
 
+    def plane_power_stored(self, name):
+        """Whether the power of the plane is a result stored in the .fsp (else computed from E and H)."""
+        src = self.plane_source(name)
+        return bool(src and src[0] == "fsp" and "power" in src[1].results)
+
     def plane_transmission(self, name):
-        """P / P_source of a plane at every frequency (|S_i1|^2 when all of it is in one mode), or
+        """T of a plane at every frequency: P / P_source (|S_i1|^2 when all of it is in one mode), or
         P / P(first plane) when the fields have no absolute scale (see power_reference); or None."""
         pw, ref = self.plane_power_spectrum(name), self.power_reference()
         if pw is None or ref is None:
             return None
         return pw / np.where(ref[0] == 0, np.nan, ref[0])
 
-    def plane_mode(self, name, tol=0.05):
-        """(name, y, z, M, neff) of the stored mode belonging to a plane: the port's own mode, or that
-        of a mode expansion monitor (or port) at the same x, within tol um. None if there is none."""
-        x, _, _ = self.plane_grid(name)
-        candidates = [(name, None)] if any(pt["name"] == name for pt in self.ports) else []
-        candidates += [(mm["name"], mm["x"]) for mm in self.mode_monitors]
-        candidates += [(pt["name"], pt["x"]) for pt in self.ports if pt["name"] != name]
-        for cand, cx in candidates:
-            if cx is not None and abs(cx - x) > tol:
-                continue
-            try:
-                y, z, M, neff, _ = self.stored_mode(cand)
-            except Exception:
-                continue
-            return cand, y, z, M, neff
-        return None
+    # ---------- expansion of the recorded field on the stored modes (as Lumerical's mode expansion) ----------
+    def h_scale(self, name):
+        """How many times larger the recorded H of a plane is than in SI units. Lumerical writes the H
+        of its .h5 field files multiplied by Z0 (in the units of E). Told apart by the ratio of E to H:
+        in SI it is Z0/n (about 100 to 377 ohm), multiplied by Z0 it is 1/n (0.25 to 1)."""
+        cache = self.__dict__.setdefault("_h_scale", {})
+        if name not in cache:
+            kk = self._own_indices(name)[len(self._own_indices(name)) // 2]
+            e = sum(np.sum(np.abs(self._plane_field_own(name, c, kk)) ** 2) for c in ("Ey", "Ez"))
+            h = sum(np.sum(np.abs(self._plane_field_own(name, c, kk)) ** 2) for c in ("Hy", "Hz"))
+            ratio = np.sqrt(e / h) if h else 1.0
+            cache[name] = Z0 if ratio < 10 else 1.0
+        return cache[name]
 
-    def plane_mode_transmission(self, name):
-        """(mode name, eta, T_mode) over all frequencies: eta is the overlap of the recorded field with
-        the stored mode of the plane, T_mode = eta * P / P_source the power in that mode (|S_i1|^2 of
-        the mode). None if the plane has no stored mode or no E and H fields."""
-        cache = self.__dict__.setdefault("_mode_spectra", {})
-        if name in cache:
-            return cache[name]
-        cache[name] = None
-        mode = self.plane_mode(name)
-        T = self.plane_transmission(name)
-        if mode is None or RegularGridInterpolator is None or \
+    def plane_mode_owners(self, name, tol=0.05):
+        """The ports and mode expansion monitors whose stored modes the field of a plane can be
+        expanded on: the port itself, and those at the same x (within tol um)."""
+        x = self.plane_grid(name)[0]
+        owners = [name] if any(pt["name"] == name and self.stored_modes(name) for pt in self.ports) else []
+        for o in [pt["name"] for pt in self.ports] + [mm["name"] for mm in self.mode_monitors]:
+            if o != name and o not in owners and self.stored_modes(o) and abs(self._owner_x(o) - x) <= tol:
+                owners.append(o)
+        return owners
+
+    def _owner_x(self, owner):
+        for pl in list(self.ports) + list(self.mode_monitors):
+            if pl["name"] == owner:
+                return pl["x"]
+        return np.inf
+
+    def plane_expansion(self, name, owner=None, mode=0):
+        """Expansion of the field recorded in a plane on a stored mode (of the port itself or of a
+        port / mode expansion monitor at the same x), as Lumerical's 'expansion for port monitor':
+        dict with P_forward and P_backward, the power carried by the mode towards +x and towards -x,
+        and T_forward, T_backward, those divided by the power reference (see power_reference), at
+        every frequency of the model; mode_number, neff, owner. None if not possible."""
+        owner = owner or name
+        key = (name, owner, mode)
+        cache = self.__dict__.setdefault("_expansions", {})
+        if key in cache:
+            return cache[key]
+        cache[key] = None
+        if RegularGridInterpolator is None or not self.plane_source(name) or \
                 not all(self.plane_has(name, c) for c in ("Ey", "Ez", "Hy", "Hz")):
             return None
-        mname, ym, zm, M, _ = mode
+        try:
+            ym, zm, M, neff, _ = self.stored_mode(owner, mode)
+        except Exception:
+            return None
         _, y, z = self.plane_grid(name)
 
         def integ(F):
             return TRAPZ(TRAPZ(F, y, axis=1), z, axis=0)
 
-        # the mode on the grid of the recorded field (done once)
-        Z, Y = np.meshgrid(np.clip(z, zm[0], zm[-1]), np.clip(y, ym[0], ym[-1]), indexing="ij")
+        # the mode on the grid of the recorded field (zero outside the mode's own grid), in SI units
+        Z, Y = np.meshgrid(z, y, indexing="ij")
         pts = np.stack([Z, Y], -1)
-        Mi = {c: RegularGridInterpolator((zm, ym), M[c].real)(pts) + 1j * RegularGridInterpolator((zm, ym), M[c].imag)(pts)
-              for c in ("Ey", "Ez", "Hy", "Hz")}
-        c_mm = integ(np.real(Mi["Ey"] * np.conj(Mi["Hz"]) - Mi["Ez"] * np.conj(Mi["Hy"])))
-        ks = self._spectrum_indices()
-        etas = []
-        for k in ks:
-            E = {c: self.plane_field(name, c, int(k)) for c in ("Ey", "Ez", "Hy", "Hz")}
-            a = integ(E["Ey"] * np.conj(Mi["Hz"]) - E["Ez"] * np.conj(Mi["Hy"]))
-            b = integ(Mi["Ey"] * np.conj(E["Hz"]) - Mi["Ez"] * np.conj(E["Hy"]))
-            d = integ(np.real(E["Ey"] * np.conj(E["Hz"]) - E["Ez"] * np.conj(E["Hy"])))
-            etas.append(float(np.real(a * b / c_mm) / d) if c_mm and d else np.nan)
-        eta = self._fill_spectrum(ks, etas)
-        cache[name] = (mname, eta, None if T is None else T * eta)
-        return cache[name]
+        Mi = {}
+        for c in ("Ey", "Ez", "Hy", "Hz"):
+            re = RegularGridInterpolator((zm, ym), M[c].real, bounds_error=False, fill_value=0.0)(pts)
+            im = RegularGridInterpolator((zm, ym), M[c].imag, bounds_error=False, fill_value=0.0)(pts)
+            Mi[c] = re + 1j * im
+        mode_scale = self.mode_h_scale(owner, mode)
+        Mi["Hy"], Mi["Hz"] = Mi["Hy"] / mode_scale, Mi["Hz"] / mode_scale
+        mm = integ(Mi["Ey"] * np.conj(Mi["Hz"]) - Mi["Ez"] * np.conj(Mi["Hy"]))
+        if not mm:
+            return None
+        if mm.real < 0:  # a mode stored for the -x direction: its +x twin has the transverse H reversed
+            Mi["Hy"], Mi["Hz"], mm = -Mi["Hy"], -Mi["Hz"], -mm
+        n_mode = 0.5 * mm.real  # power of the mode
+        s = self.h_scale(name)
+        f_own = self.plane_freqs(name)
+        ks = self._own_indices(name)
+        fwd, bwd = [], []
+        for kk in ks:
+            E = {c: self._plane_field_own(name, c, int(kk)) for c in ("Ey", "Ez", "Hy", "Hz")}
+            E["Hy"], E["Hz"] = E["Hy"] / s, E["Hz"] / s
+            A = integ(E["Ey"] * np.conj(Mi["Hz"]) - E["Ez"] * np.conj(Mi["Hy"]))   # (a + b) mm
+            B = integ(np.conj(Mi["Ey"]) * E["Hz"] - np.conj(Mi["Ez"]) * E["Hy"])   # (a - b) mm*
+            a = 0.5 * (A / mm + B / np.conj(mm))
+            b = 0.5 * (A / mm - B / np.conj(mm))
+            # in the units of plane_power_spectrum (Re of E x H* of the stored fields)
+            fwd.append(abs(a) ** 2 * n_mode * 2 * s)
+            bwd.append(abs(b) ** 2 * n_mode * 2 * s)
+        P_f, P_b = self._on_model_freqs(f_own[ks], fwd), self._on_model_freqs(f_own[ks], bwd)
+        ref = self.power_reference()
+        refs = np.where(ref[0] == 0, np.nan, ref[0]) if ref is not None else None
+        numbers = self.stored_modes(owner)
+        cache[key] = {
+            "P_forward": P_f, "P_backward": P_b,
+            "T_forward": P_f / refs if refs is not None else None,
+            "T_backward": P_b / refs if refs is not None else None,
+            "mode_number": numbers[mode][0], "neff": neff, "owner": owner,
+        }
+        return cache[key]
+
+    def mode_h_scale(self, owner, mode=0):
+        """As h_scale, for a stored mode (SI units in the projects seen so far)."""
+        _, _, M, _, _ = self.stored_mode(owner, mode)
+        e = sum(np.sum(np.abs(M[c]) ** 2) for c in ("Ey", "Ez"))
+        h = sum(np.sum(np.abs(M[c]) ** 2) for c in ("Hy", "Hz"))
+        return Z0 if h and np.sqrt(e / h) < 10 else 1.0
+
+    def port_outgoing(self, port_name, mode=0):
+        """Power (spectrum, model frequencies) leaving the device through a port in one of its stored
+        modes: towards -x at a port that injects towards +x, and the other way; and the incident
+        power (towards the device). (outgoing, incident, expansion) or None."""
+        pt = next((p for p in self.ports if p["name"] == port_name), None)
+        ex = self.plane_expansion(port_name, port_name, mode) if pt else None
+        if ex is None:
+            return None
+        if pt["direction"] == "+":
+            return ex["P_backward"], ex["P_forward"], ex
+        return ex["P_forward"], ex["P_backward"], ex
+
+    # ---------- other monitors: planes along the device (x-y, x-z), from the .h5 ----------
+    def other_monitors(self):
+        """2D monitors with an .h5 field whose plane is not normal to x (e.g. xz, xy_si): list of
+        dicts with name, group, the axes of the plane (u, v) and the normal axis."""
+        if self.h5 is None:
+            return []
+        out = []
+        for ob in self.fsp.objects:
+            grp = ob.props.get("HDF5DataGroup")
+            if not grp or grp not in self.h5 or not ob.props.get("enabled", 1) or "monitorShape" not in ob.props:
+                continue
+            g = self.h5[grp]
+            try:
+                sizes = {c: int(np.size(g[c])) for c in "xyz"}
+            except Exception:
+                continue
+            flat = [c for c in "xyz" if sizes[c] == 1]
+            if len(flat) != 1 or flat[0] == "x":
+                continue
+            u, v = [c for c in "xyz" if c != flat[0]]
+            out.append({"name": ob.name.split("::")[-1], "obj": ob, "group": grp, "normal": flat[0], "u": u, "v": v})
+        return out
+
+    def monitor_field(self, mon, comp, k):
+        """Field component of an other_monitors() plane at the model's frequency k (the nearest of
+        its own), as (N_v, N_u); and the wavelength (nm) used."""
+        f_own = self.object_freqs(mon["obj"])
+        kk = self.freq_index(f_own, k) if f_own is not None else 0
+        a = self.h5_field(mon["group"], comp, kk)  # (z, y, x)
+        a = {"y": a[:, 0, :], "z": a[0, :, :]}[mon["normal"]]  # (z, x) or (y, x)
+        lam = C0 / f_own[kk] * 1e9 if f_own is not None else None
+        return a, lam
+
+    def monitor_grid(self, mon):
+        g = self.h5[mon["group"]]
+        u, v = np.ravel(g[mon["u"]][()]).astype(float), np.ravel(g[mon["v"]][()]).astype(float)
+        scale = 1e6 if max(np.max(np.abs(u)), np.max(np.abs(v))) < 1e-2 else 1.0
+        return u * scale, v * scale
 
     def _extract_structures(self):
         """
@@ -1479,49 +1623,66 @@ class FSPModelData:
             freqs = np.array([C0 / 1310e-9])
             return freqs, np.array([1310.0]), 0
 
-    def stored_mode(self, port_or_mon_name):
-        """
-        Extracts stored cross-section refractive index n(z, y) and mode fields Ex..Hz(z, y)
-        from `::<port> Mode Expansion Monitor` (or standalone mode monitor), just like
-        `stored_mode(port)` in `fsp_plots.py`.
-        """
-        target_ob = None
+    def _mode_object(self, name):
+        """The object holding the stored modes of a port or mode expansion monitor, or None."""
         for pt in self.ports:
-            if pt["name"] == port_or_mon_name and pt["mode_exp_obj"] is not None:
-                target_ob = pt["mode_exp_obj"]
-                break
-        if target_ob is None:
-            for mm in self.mode_monitors:
-                if mm["name"] == port_or_mon_name:
-                    target_ob = mm["obj"]
-                    break
-        if target_ob is None:
-            target_ob = self.fsp.get(f"::{port_or_mon_name} Mode Expansion Monitor")
+            if pt["name"] == name:
+                return pt["mode_exp_obj"]
+        for mm in self.mode_monitors:
+            if mm["name"] == name:
+                return mm["obj"]
+        try:
+            return self.fsp.get(f"::{name} Mode Expansion Monitor")
+        except Exception:
+            return None
 
-        p = target_ob.props
+    def _mode_layout(self, p):
+        """[(index of E, index of H)] of the stored modes, and the index of the refractive index, from
+        the names of the stored data: E1, H1, E2, H2, ..., index (or E, H, index)."""
+        e, h, idx_n = {}, {}, None
+        for i in range(int(p.get("dataCount", 3))):
+            nm = str(p.get(f"dataEHnName{i}", ""))
+            if nm == "index":
+                idx_n = i
+            elif nm[:1] in ("E", "H"):
+                (e if nm[0] == "E" else h).setdefault(nm[1:] or "1", i)
+        pairs = [(e[k], h[k]) for k in e if k in h]
+        return pairs or [(0, 1)], (2 if idx_n is None else idx_n)
+
+    def stored_modes(self, name):
+        """The modes stored with a port or mode expansion monitor: [(mode number, n_eff)], in the
+        stored order; [] if it has none (not calculated, or not saved)."""
+        ob = self._mode_object(name)
+        if ob is None or "yMatrix" not in ob.props or "freqEHnx0" not in ob.props:
+            return []
+        p = ob.props
+        pairs, _ = self._mode_layout(p)
+        numbers = np.ravel(p.get("modeNumbers", np.arange(1, len(pairs) + 1))).astype(int)
+        neffs = np.ravel(p.get("neff", np.array([])))
+        return [(int(numbers[i]) if i < numbers.size else i + 1, float(neffs[i].real) if i < neffs.size else None)
+                for i in range(len(pairs))]
+
+    def stored_mode(self, port_or_mon_name, mode=0):
+        """
+        The cross-section refractive index n(z, y) and the fields Ex..Hz(z, y) of a stored mode
+        (mode: its place among the stored modes, 0 = the first) of a port or mode expansion
+        monitor, from `::<port> Mode Expansion Monitor` or the monitor itself.
+        Returns (y, z, M, neff, mode wavelength in nm).
+        """
+        target_ob = self._mode_object(port_or_mon_name)
+        p = target_ob.props if target_ob is not None else {}
         if "yMatrix" not in p or "freqEHnx0" not in p:
             raise RuntimeError(f"'{port_or_mon_name}' has no stored mode: its mode was not calculated or not saved "
                                "in this project (a project saved before running, or a disabled port / monitor).")
         y = p["yMatrix"].ravel() * 1e6
         z = p["zMatrix"].ravel() * 1e6
-
-        # Determine indices for E, H, and refractive index from dataEHnName*
-        data_count = int(p.get("dataCount", 3))
-        idx_e, idx_h, idx_n = 0, 1, 2
-        for i in range(data_count):
-            nm = str(p.get(f"dataEHnName{i}", ""))
-            if nm.startswith("E") and idx_e == 0:
-                idx_e = i
-            elif nm.startswith("H") and idx_h == 1:
-                idx_h = i
-            elif nm == "index":
-                idx_n = i
-
+        pairs, idx_n = self._mode_layout(p)
+        idx_e, idx_h = pairs[min(mode, len(pairs) - 1)]
         g = lambda c, i: p[f"freqEHn{c}{i}"][0, :, :, 0].T  # shape (Nz, Ny)
         M = {f"E{c}": g(c, idx_e) for c in "xyz"} | {f"H{c}": g(c, idx_h) for c in "xyz"}
         M["n"] = np.abs(g("x", idx_n).real)
-        neff_arr = p.get("neff")
-        neff = float(neff_arr.ravel()[0].real) if isinstance(neff_arr, np.ndarray) and neff_arr.size else None
+        modes = self.stored_modes(port_or_mon_name)
+        neff = modes[min(mode, len(modes) - 1)][1] if modes else None
         mode_freq = p.get("modeFrequency")
         mode_lam_nm = (C0 / mode_freq * 1e9) if mode_freq else None
         return y, z, M, neff, mode_lam_nm
@@ -1554,77 +1715,6 @@ class FSPModelData:
         else:
             cache.move_to_end(key)
         return arr[..., k]
-
-    def compute_power_and_mode_coupling(self):
-        """
-        Computes `P`, `Prel`, `eta`, `Tmode`, `xs`, `freqs`, `lam` across all ports and frequencies
-        using the exact overlap-integral equations from `fsp_plots.py` (section 5).
-        """
-        if self._power_cache is not None:
-            return self._power_cache
-        if self.h5 is None:
-            raise RuntimeError("No .h5 field file is loaded.")
-        if RegularGridInterpolator is None:
-            raise RuntimeError("scipy is required for mode overlap interpolation.")
-
-        freqs, lam, _ = self.get_frequencies_and_wavelengths()
-        n_ports = len(self.ports)
-        n_freqs = len(freqs)
-        P = np.zeros((n_ports, n_freqs))
-        eta = np.zeros_like(P)
-        xs = np.zeros(n_ports)
-
-        def integ(F2, y_arr, z_arr):
-            return TRAPZ(TRAPZ(F2, y_arr, axis=1), z_arr, axis=0)
-
-        P[:] = np.nan
-        eta[:] = np.nan
-        for i, pt in enumerate(self.ports):
-            xs[i] = pt["x"]
-            src = self.plane_source(pt["name"])
-            if not src or src[0] != "h5":  # e.g. a disabled port: recorded nothing
-                continue
-            m = src[1]
-            try:
-                ys, zs, M, _, _ = self.stored_mode(pt["name"])
-            except Exception:  # no stored mode: only the power
-                ys = zs = M = None
-            if M is None:
-                for k in range(n_freqs):
-                    pw = self.plane_power(pt["name"], k)
-                    P[i, k] = np.nan if pw is None else pw
-                continue
-            keep = ys >= -1e-9
-            ys = ys[keep]
-            M = {k: v[:, keep] for k, v in M.items()}
-
-            y = self.h5[m]["y"][()]
-            z = self.h5[m]["z"][()]
-            xs[i] = float(self.h5[m]["x"][0])
-
-            for k in range(n_freqs):
-                E = {c: self.h5_field(m, c, k)[:, :, 0] for c in ("Ey", "Ez", "Hy", "Hz")}
-                P[i, k] = integ(np.real(E["Ey"] * np.conj(E["Hz"]) - E["Ez"] * np.conj(E["Hy"])), y, z)
-                Z, Y = np.meshgrid(np.clip(zs, z[0], z[-1]), np.clip(ys, y[0], y[-1]), indexing="ij")
-                pts = np.stack([Z, Y], -1)
-                Ei = {
-                    c: RegularGridInterpolator((z, y), v.real)(pts)
-                    + 1j * RegularGridInterpolator((z, y), v.imag)(pts)
-                    for c, v in E.items()
-                }
-                a = integ(Ei["Ey"] * np.conj(M["Hz"]) - Ei["Ez"] * np.conj(M["Hy"]), ys, zs)
-                b = integ(M["Ey"] * np.conj(Ei["Hz"]) - M["Ez"] * np.conj(Ei["Hy"]), ys, zs)
-                c = integ(np.real(M["Ey"] * np.conj(M["Hz"]) - M["Ez"] * np.conj(M["Hy"])), ys, zs)
-                d = integ(np.real(Ei["Ey"] * np.conj(Ei["Hz"]) - Ei["Ez"] * np.conj(Ei["Hy"])), ys, zs)
-                eta[i, k] = np.real(a * b / c) / d
-
-        valid = [i for i in range(n_ports) if np.isfinite(P[i]).any()]
-        if not valid:
-            raise RuntimeError("No port has a recorded field in the .h5 file.")
-        Prel = P / P[valid[0]]
-        Tmode = Prel * eta
-        self._power_cache = (xs, freqs, lam, P, Prel, eta, Tmode)
-        return self._power_cache
 
 
 # ======================================================================
@@ -2225,7 +2315,7 @@ class ModelOrthoCanvas2D(tk.Frame):
 
         # 4. Draw PORTS (and mode expansion monitors) in YELLOW (#ffd700 / #ffee55)
         for pt in self.model.port_planes():
-            is_sel = (pt["name"] == self.selected_port) or (self.selected_port == "All Ports")
+            is_sel = (pt["name"] == self.selected_port) or (self.selected_port == ALL_OBJECTS)
             p_color = T["port_yellow_bright"] if pt["name"] == self.selected_port else T["port_yellow"]
             lw = 3.0 if pt["name"] == self.selected_port else 2.0
             if not pt["enabled"]:  # a disabled port takes no part in the simulation: dimmed
@@ -3156,14 +3246,22 @@ def self_test(report, fsp=None):
         if fsp:
             check("open file", lambda: f"{len(app.model.structures)} structures, {len(app.model.ports)} ports"
                                        if app.model is not None else need(None, "the model"))
-            for option in app.RESULT_OPTIONS:
-                def plot(option=option):
-                    app.result_var.set(option)
-                    app.plot_selected()
-                    root.update()
-                    texts = [t.get_text() for ax in app.fig.axes for t in ax.texts if t.get_text().startswith("Cannot")]
-                    return texts[0].replace("\n", " ")[:160] if texts else ""
-                check(f"plot: {option}", plot)
+            # every result of every object (the analyses of the whole model once, with All objects)
+            for obj in app.cmb_port["values"]:
+                app.port_var.set(obj)
+                app._update_result_choices(prefer_object=True)
+                for option in app.cmb_result["values"]:
+                    if option == app.RESULT_SEPARATOR:
+                        break
+                    def plot(option=option):
+                        app.result_var.set(option)
+                        ok = app.plot_selected()
+                        root.update()
+                        if not ok:
+                            texts = [t.get_text() for ax in app.fig.axes for t in ax.texts]
+                            raise RuntimeError(" ".join(texts).replace("\n", " ")[:200])
+                        return ""
+                    check(f"plot: {obj}: {option}", plot)
     except Exception as err:
         failed.append("start")
         lines.append(f"FAIL  start: {type(err).__name__}: {err}")
@@ -4249,22 +4347,6 @@ class FSPGuiApp:
       4. Fifth Larger Plot Window (embedded large right pane + optional standalone window)
     """
 
-    RESULT_OPTIONS = [
-        "Cross-Sections & Port Modes (n & |E|²)",
-        "Stored Port Mode |E|² Profile (YZ)",
-        "Stored Refractive Index n(y, z) (YZ)",
-        "Simulated Field |E|² in YZ Planes (ports & monitors)",
-        "Power Through YZ Planes vs x & λ (ports & monitors)",
-        "Power Spectrum at Selected Plane (P / P_source)",
-        "S-Parameters from Power |S_i1|² (dB)",
-        "Power & Mode Coupling vs. Port x (.h5)",
-        "Port Transmission vs. Wavelength λ (.h5)",
-        "XZ Propagation |E|² at y=0 (dB, .h5)",
-        "Top-View Layout & Taper Zoom (XY)",
-        "Port Mode Field Components (|Ex|..|Hz|)",
-        "Source Time Signal & Spectrum",
-    ]
-
     def __init__(self, root, initial_fsp=None, initial_h5=None):
         self.root = root
         self.root.title(APP_NAME)
@@ -4456,38 +4538,51 @@ class FSPGuiApp:
         self.cmb_lam.bind("<<ComboboxSelected>>", lambda e: self.plot_selected())
         Tooltip(self.cmb_lam, "Select wavelength λ for single-wavelength field plots")
 
-        # Results dropdown menu
-        self.result_var = tk.StringVar(value=self.RESULT_OPTIONS[0])
+        # Result dropdown menu: the results of the selected object that the open files hold or
+        # that can be calculated from them, then the analyses of the whole model
+        self.result_var = tk.StringVar(value="")
+        self._result_funcs = {}
         self.cmb_result = ttk.Combobox(
             toolbar,
             textvariable=self.result_var,
             state="readonly",
             width=self.RESULT_WIDTH,
-            style="Dark.TCombobox",
+            style="Result.Dark.TCombobox",
             font=ui_font(10),
-            values=self.RESULT_OPTIONS,
+            values=[],
+            height=24,
         )
         self.cmb_result.pack(side=tk.RIGHT, padx=(4, 4))
-        self.cmb_result.bind("<<ComboboxSelected>>", lambda e: self.plot_selected())
+        self.cmb_result.bind("<<ComboboxSelected>>", self._on_result_selected)
+        self._wide_popdown(self.cmb_result, "Result.Dark.TCombobox")
+        Tooltip(self.cmb_result, "The results of the selected object, named as in Lumerical (getresult):\n"
+                                 "[fsp] stored in the .fsp file, [h5] stored in the .h5 field file,\n"
+                                 "[calc] calculated by FSP Viewer from them.\n"
+                                 "Below the line: analyses of the whole model.")
         tk.Label(
             toolbar, text="Result:", font=ui_font(10, bold=True), bg=T["bar_bg"], fg=T["text_muted"]
         ).pack(side=tk.RIGHT, padx=(8, 2))
 
-        # Port dropdown menu
-        self.port_var = tk.StringVar(value="All Ports")
+        # Object dropdown menu: ports, monitors, FDTD::ports (S-parameters)
+        self.port_var = tk.StringVar(value=ALL_OBJECTS)
         self.cmb_port = ttk.Combobox(
             toolbar,
             textvariable=self.port_var,
             state="readonly",
             width=16,
-            style="Dark.TCombobox",
+            style="Object.Dark.TCombobox",
             font=ui_font(10),
-            values=["All Ports"],
+            values=[ALL_OBJECTS],
+            height=24,
         )
         self.cmb_port.pack(side=tk.RIGHT, padx=(4, 4))
         self.cmb_port.bind("<<ComboboxSelected>>", self._on_port_dropdown_changed)
+        self._wide_popdown(self.cmb_port, "Object.Dark.TCombobox")
+        Tooltip(self.cmb_port, "The port or monitor whose results are listed (named as in the model);\n"
+                               "FDTD::ports holds the S-parameters. A click on a port or monitor in the\n"
+                               "views selects it too.")
         tk.Label(
-            toolbar, text="Port:", font=ui_font(10, bold=True), bg=T["bar_bg"], fg=T["port_yellow"]
+            toolbar, text="Object:", font=ui_font(10, bold=True), bg=T["bar_bg"], fg=T["port_yellow"]
         ).pack(side=tk.RIGHT, padx=(8, 2))
 
         # ==================================================================
@@ -4706,7 +4801,7 @@ class FSPGuiApp:
             return default
         return value if 0.15 <= value <= 0.85 else default
 
-    RESULT_WIDTH, RESULT_WIDTH_NARROW = 32, 22  # characters of the Result selector (narrow: tight toolbar)
+    RESULT_WIDTH, RESULT_WIDTH_NARROW = 40, 26  # characters of the Result selector (narrow: tight toolbar)
 
     def _fit_toolbar(self):
         """When the controls of the toolbar do not fit, first hide the branding, then narrow the
@@ -4933,16 +5028,11 @@ class FSPGuiApp:
             title += f" ({os.path.basename(self.model.h5_path)})"
         self.root.title(f"{APP_NAME} — {title}")
 
-        # Populate Port dropdown
-        port_choices = ["All Ports"] + [pt["name"] for pt in self.model.ports]
-        for mm in self.model.mode_monitors:
-            port_choices.append(mm["name"])
-        for mm in self.model.field_monitors:  # y-z planes with a recorded field
-            if mm["has_data"]:
-                port_choices.append(mm["name"])
-        self.cmb_port["values"] = port_choices
-        default_port = self.model.ports[0]["name"] if self.model.ports else "All Ports"
-        self.port_var.set("All Ports" if len(self.model.ports) > 1 else default_port)
+        # Populate the Object dropdown (the Result dropdown follows the object)
+        self.cmb_port["values"] = self._object_choices()
+        self.port_var.set(ALL_OBJECTS)
+        self.result_var.set("")
+        self._update_result_choices()
 
         # Populate Wavelength dropdown
         freqs, lam, kc = self.model.get_frequencies_and_wavelengths()
@@ -4977,12 +5067,7 @@ class FSPGuiApp:
 
     def _on_port_dropdown_changed(self, _event=None):
         sel_port = self.port_var.get()
-        # a field monitor has no stored mode: show its recorded field instead
-        if self.model is not None and any(mm["name"] == sel_port for mm in self.model.field_monitors) \
-                and self.result_var.get() not in ("Simulated Field |E|² in YZ Planes (ports & monitors)", "Power Through YZ Planes vs x & λ (ports & monitors)",
-                                                  "Power Spectrum at Selected Plane (P / P_source)", "S-Parameters from Power |S_i1|² (dB)",
-                                                  "Top-View Layout & Taper Zoom (XY)"):
-            self.result_var.set("Simulated Field |E|² in YZ Planes (ports & monitors)")
+        self._update_result_choices(prefer_object=_event is not None)
         with self.busy(f"Showing {sel_port} in the model views"):
             self.view_xy.set_selected_port(sel_port)
             self.view_xz.set_selected_port(sel_port)
@@ -5001,6 +5086,138 @@ class FSPGuiApp:
             if 0 <= idx < len(lam):
                 return idx
         return kc
+
+    # ==================================================================
+    # The Object and Result Selectors
+    # ==================================================================
+    # Results are named as in Lumerical (getresult): E, H, P, T, 'expansion for port monitor',
+    # 'mode profiles', S, and the datasets stored in the .fsp under their stored names (time_signal,
+    # P0). The tag says where a result comes from: [fsp] the .fsp file, [h5] the .h5 field file,
+    # [calc] calculated by this program from them (Lumerical calculates these too, when asked).
+    RESULT_SEPARATOR = "──────── whole model ────────"
+    PORTS_OBJECT = "FDTD::ports"
+
+    def _wide_popdown(self, cmb, style):
+        """Make the dropdown list of a combobox as wide as its longest entry (extending to the left)."""
+        def post():
+            values = cmb.cget("values") or ()
+            font = ui_font(10)
+            need = max((font.measure(str(v)) for v in values), default=0) + dpx(40)
+            extra = max(0, need - cmb.winfo_width())
+            ttk.Style(self.root).configure(style, postoffset=(-extra, 0, extra, 0))
+        cmb.configure(postcommand=post)
+
+    def _lum_name(self, obj):
+        """The name of an object as Lumerical's getresult takes it."""
+        pt = next((p for p in self.model.ports if p["name"] == obj), None) if self.model else None
+        if pt is not None:
+            return pt["full_name"].replace("::model::", "", 1)
+        return obj
+
+    def _object_choices(self):
+        """All objects, the ports, FDTD::ports (when S-parameters can be calculated), the mode expansion
+        monitors, the field monitors in y-z planes and the other 2D monitors with a field."""
+        m = self.model
+        choices = [ALL_OBJECTS] + [pt["name"] for pt in m.ports]
+        if any(m.port_outgoing(pt["name"]) for pt in m.ports if pt.get("is_source")):
+            choices.append(self.PORTS_OBJECT)
+        choices += [mm["name"] for mm in m.mode_monitors if mm["placed"]]
+        choices += [mm["name"] for mm in m.field_monitors if mm["has_data"]]
+        choices += [mon["name"] for mon in m.other_monitors() if mon["name"] not in choices]
+        return choices
+
+    def _object_entries(self, obj):
+        """(label, plot function) of the results of one object."""
+        m = self.model
+        out = []
+        planes = m.field_planes()
+        port = next((p for p in m.ports if p["name"] == obj), None)
+        if obj in planes:
+            tag = "[h5]" if m.plane_source(obj)[0] == "h5" else "[fsp]"
+            has_e = any(m.plane_has(obj, c) for c in ("Ex", "Ey", "Ez"))
+            has_h = any(m.plane_has(obj, c) for c in ("Hx", "Hy", "Hz"))
+            eh = all(m.plane_has(obj, c) for c in ("Ey", "Ez", "Hy", "Hz"))
+            if has_e:
+                out.append((f"E — |E|² in the plane at λ {tag}", lambda fig, k: self._plot_plane_field(fig, obj, "E", k)))
+            if has_h:
+                out.append((f"H — |H|² in the plane at λ {tag}", lambda fig, k: self._plot_plane_field(fig, obj, "H", k)))
+            if eh and all(m.plane_has(obj, c) for c in ("Ex", "Hx")):
+                out.append(("P — Poynting vector at λ [calc]", lambda fig, k: self._plot_plane_field(fig, obj, "P", k)))
+            if m.plane_power_spectrum(obj) is not None and m.power_reference() is not None:
+                out.append((f"T — transmission vs λ {'[fsp]' if m.plane_power_stored(obj) else '[calc]'}",
+                            lambda fig, k: self._plot_plane_T(fig, obj, k)))
+            for owner in m.plane_mode_owners(obj) if eh else []:
+                label = ("expansion for port monitor — T_forward, T_backward [calc]" if owner == obj
+                         else f"expansion on the modes of {owner} (same x) [calc]")
+                out.append((label, lambda fig, k, owner=owner: self._plot_expansion(fig, obj, owner, k)))
+        if m.stored_modes(obj):
+            out.append(("mode profiles — |E|² and index n [fsp]", lambda fig, k: self._plot_mode_profiles(fig, obj)))
+            out.append(("mode profiles — Ex … Hz [fsp]", lambda fig, k: self._plot_mode_components(fig, obj)))
+        if port is not None and self._source_object(obj) is not None:
+            out.append(("time_signal, P0 — source pulse and spectrum [fsp]", lambda fig, k: self._plot_source_pulse(fig, obj)))
+        mm = next((mon for mon in m.mode_monitors if mon["name"] == obj), None)
+        if mm is not None:
+            for plane in planes:
+                if obj in m.plane_mode_owners(plane):
+                    out.append((f"expansion of {plane} (same x) — T_forward, T_backward [calc]",
+                                lambda fig, k, plane=plane: self._plot_expansion(fig, plane, obj, k)))
+        mon = next((mon for mon in m.other_monitors() if mon["name"] == obj), None)
+        if mon is not None:
+            g = m.h5[mon["group"]]
+            if any(c in g for c in ("Ex", "Ey", "Ez")):
+                out.append(("E — |E|² in the plane [h5]", lambda fig, k: self._plot_monitor_2d(fig, mon, "E", k)))
+            if any(c in g for c in ("Hx", "Hy", "Hz")):
+                out.append(("H — |H|² in the plane [h5]", lambda fig, k: self._plot_monitor_2d(fig, mon, "H", k)))
+        if obj == self.PORTS_OBJECT:
+            out.append(("S — |S|² of the port modes [calc]", lambda fig, k: self._plot_port_S(fig, k)))
+        return out
+
+    def _model_entries(self):
+        """(label, plot function) of the analyses of the whole model."""
+        m = self.model
+        out = []
+        planes = m.field_planes()
+        if any(m.plane_power(n, 0) is not None for n in planes):
+            out.append(("All planes — T along x and vs λ [calc]", lambda fig, k: self._plot_plane_power(fig, self.port_var.get(), k)))
+        if planes:
+            out.append(("All planes — E: |E|² at λ [h5]" if m.h5 is not None else "All planes — E: |E|² at λ [fsp]",
+                        lambda fig, k: self._plot_simulated_port_fields(fig, ALL_OBJECTS, k)))
+        if m.power_reference() is not None and any(m.plane_transmission(n) is not None for n in planes):
+            out.append(("All planes — |S_i1|² from their power [calc]", lambda fig, k: self._plot_s_parameters(fig, k)))
+        if any(m.stored_modes(pt["name"]) for pt in m.ports) or m.mode_monitors:
+            out.append(("All ports — mode profiles [fsp]", lambda fig, k: self._plot_cross_sections_and_modes(fig, ALL_OBJECTS)))
+        if m.structures:
+            out.append(("Top view — structures, FDTD region, ports [fsp]", lambda fig, k: self._plot_layout_top_view(fig, self.port_var.get())))
+        src = m.source_port()
+        if src is not None and self._source_object(src["name"]) is not None:
+            out.append(("Source — time_signal, P0 [fsp]", lambda fig, k: self._plot_source_pulse(fig, src["name"])))
+        return out
+
+    def _update_result_choices(self, prefer_object=False):
+        """List the results of the selected object, then the analyses of the whole model. A result of
+        the object keeps its name for the new object (E stays E); an analysis of the whole model stays
+        chosen unless prefer_object (the object was chosen in its dropdown: show its own results)."""
+        if self.model is None:
+            return
+        obj = self.port_var.get()
+        own = [] if obj == ALL_OBJECTS else self._object_entries(obj)
+        model = self._model_entries()
+        entries = own + ([(self.RESULT_SEPARATOR, None)] if own and model else []) + model
+        self._result_funcs = {label: func for label, func in entries if func is not None}
+        self.cmb_result["values"] = [label for label, _ in entries]
+        own_labels, model_labels = [lb for lb, _ in own], [lb for lb, _ in model]
+        current = self.result_var.get()
+        if current in own_labels or (current in model_labels and not (prefer_object and own_labels)):
+            return
+        name = current.split(" — ")[0]
+        same = next((lb for lb in own_labels if lb.split(" — ")[0] == name), None)
+        self.result_var.set(same or (own_labels or model_labels or [""])[0])
+
+    def _on_result_selected(self, _event=None):
+        if self.result_var.get() == self.RESULT_SEPARATOR:  # the line is not a result
+            self.result_var.set(getattr(self, "_last_result", ""))
+            return
+        self.plot_selected()
 
     # ==================================================================
     # Plotting in the 5th Larger Window & Data Export Preparation
@@ -5087,6 +5304,7 @@ class FSPGuiApp:
         if self.model is None:
             self._draw_empty_plot("Please open an .fsp file first.")
             return False
+        self._last_result = self.result_var.get()
         ok = self._render_with_status(self.fig)
         self.mpl_canvas.draw_idle()
         if self.popout_win is not None and self.popout_win.winfo_exists():
@@ -5104,79 +5322,31 @@ class FSPGuiApp:
         return not error
 
     def _get_target_ports(self, max_all=4):
-        """Returns list of port/monitor names to plot based on the Port dropdown."""
-        sel = self.port_var.get()
-        # enabled ports with a stored mode, and the enabled mode expansion monitors, along x
-        planes = [pt for pt in self.model.ports if pt.get("mode_exp_obj") is not None and pt["enabled"]]
+        """The ports (with a stored mode) and mode expansion monitors shown by the mode profiles of
+        the whole model: all of them along x, or a representative max_all of a long list."""
+        planes = [pt for pt in self.model.ports if self.model.stored_modes(pt["name"]) and pt["enabled"]]
         planes += [mm for mm in self.model.mode_monitors if mm["enabled"] and mm["placed"]]
-        all_names = [pl["name"] for pl in sorted(planes, key=lambda pl: pl["x"])]
-        if not all_names:
-            all_names = [pt["name"] for pt in self.model.ports if pt.get("mode_exp_obj") is not None]
-        if not all_names:
-            all_names = [pt["name"] for pt in self.model.ports]
-        if sel == "All Ports" or not sel:
-            if len(all_names) > max_all:
-                # Pick representative subset like fsp_plots.py (first, second, middle, last)
-                idxs = np.linspace(0, len(all_names) - 1, max_all, dtype=int)
-                return [all_names[i] for i in idxs]
-            return all_names
-        if any(mm["name"] == sel for mm in self.model.field_monitors):
-            raise RuntimeError(f"'{sel}' is a field monitor: it holds the simulated field, not a stored mode.\n"
-                               "Choose a port, or the result 'Simulated Field |E|² in YZ Planes'.")
-        return [sel]
+        names = [pl["name"] for pl in sorted(planes, key=lambda pl: pl["x"])] or \
+            [pt["name"] for pt in self.model.ports if self.model.stored_modes(pt["name"])]
+        if len(names) > max_all:  # first, second, middle, last ...
+            return [names[i] for i in np.linspace(0, len(names) - 1, max_all, dtype=int)]
+        return names
 
     def _render_onto_figure(self, fig: Figure):
         """Draw the selected result onto fig; returns None, or the reason it could not be plotted."""
         fig.clear()
         res_kind = self.result_var.get()
-        port_sel = self.port_var.get()
-        k_freq = self._selected_freq_index()
-        freqs, lam, _ = self.model.get_frequencies_and_wavelengths()
-
+        func = self._result_funcs.get(res_kind)
         try:
-            if res_kind == "Cross-Sections & Port Modes (n & |E|²)":
-                self._plot_cross_sections_and_modes(fig, port_sel)
-            elif res_kind == "Stored Port Mode |E|² Profile (YZ)":
-                self._plot_stored_single_quantity(fig, port_sel, quantity="E2")
-            elif res_kind == "Stored Refractive Index n(y, z) (YZ)":
-                self._plot_stored_single_quantity(fig, port_sel, quantity="n")
-            elif res_kind == "Simulated Field |E|² in YZ Planes (ports & monitors)":
-                self._plot_simulated_port_fields(fig, port_sel, k_freq, lam)
-            elif res_kind == "Power Through YZ Planes vs x & λ (ports & monitors)":
-                self._plot_plane_power(fig, port_sel, k_freq, lam)
-            elif res_kind == "Power Spectrum at Selected Plane (P / P_source)":
-                self._plot_plane_spectrum(fig, port_sel, k_freq, lam)
-            elif res_kind == "S-Parameters from Power |S_i1|² (dB)":
-                self._plot_s_parameters(fig, k_freq, lam)
-            elif res_kind == "Power & Mode Coupling vs. Port x (.h5)":
-                self._plot_power_and_mode_coupling(fig, port_sel)
-            elif res_kind == "Port Transmission vs. Wavelength λ (.h5)":
-                self._plot_transmission_vs_wavelength(fig, port_sel)
-            elif res_kind == "XZ Propagation |E|² at y=0 (dB, .h5)":
-                self._plot_xz_propagation(fig, k_freq, lam)
-            elif res_kind == "Top-View Layout & Taper Zoom (XY)":
-                self._plot_layout_top_view(fig, port_sel)
-            elif res_kind == "Port Mode Field Components (|Ex|..|Hz|)":
-                self._plot_port_field_components(fig, port_sel, k_freq, lam)
-            elif res_kind == "Source Time Signal & Spectrum":
-                self._plot_source_pulse(fig)
-            else:
-                self._plot_cross_sections_and_modes(fig, port_sel)
+            if func is None:
+                raise RuntimeError("Choose a result: this one is not available for the selected object.")
+            func(fig, self._selected_freq_index())
         except Exception as exc:
             fig.clear()
             ax = fig.add_subplot(111)
             self._style_mpl_axes(ax)
-            ax.text(
-                0.5,
-                0.5,
-                f"Cannot plot '{res_kind}':\n\n{exc}",
-                color=THEME["warning"],
-                fontsize=10.5,
-                ha="center",
-                va="center",
-                transform=ax.transAxes,
-                wrap=True,
-            )
+            ax.text(0.5, 0.5, f"Cannot plot '{res_kind}':\n\n{exc}", color=THEME["warning"], fontsize=10.5,
+                    ha="center", va="center", transform=ax.transAxes, wrap=True)
             ax.set_xticks([])
             ax.set_yticks([])
             return str(exc) or type(exc).__name__
@@ -5253,58 +5423,17 @@ class FSPGuiApp:
             [("n", n_mat), ("E2_norm", e2_mat)],
         )
 
-    def _plot_stored_single_quantity(self, fig: Figure, port_sel: str, quantity="E2"):
-        show = self._get_target_ports(max_all=4)
-        ncols = len(show)
-        axs = fig.subplots(1, ncols, squeeze=False)
-        self._style_mpl_axes(axs)
-
-        im = None
-        first_export = None
-        for j, pname in enumerate(show):
-            y, z, M, neff, _ = self.model.stored_mode(pname)
-            ax = axs[0, j]
-            if quantity == "n":
-                mat = M["n"]
-                im = self._colormesh(ax, y, z, mat, shading="auto", cmap="viridis")
-                ax.set_title(f"{pname}\nRefractive index n(y, z)", fontsize=9.5)
-            else:
-                E2 = sum(np.abs(M[f"E{c}"]) ** 2 for c in "xyz")
-                mat = E2 / max(float(E2.max()), 1e-30)
-                im = self._colormesh(ax, y, z, mat, shading="auto", cmap="inferno", vmin=0.0, vmax=1.0)
-                try:
-                    ax.contour(y, z, M["n"], levels=[1.2, 1.445, 1.7], colors="w", linewidths=0.6)
-                except Exception:
-                    pass
-                neff_txt = f" (n_eff={neff:.4f})" if neff else ""
-                ax.set_title(f"{pname}{neff_txt}\nStored Mode |E|²", fontsize=9.5)
-            ax.set_aspect("equal")
-            ax.set_xlabel("y (μm)")
-            if j == 0:
-                ax.set_ylabel("z (μm)")
-            if first_export is None:
-                first_export = (pname, y, z, mat)
-
-        if im is not None:
-            cb = fig.colorbar(im, ax=axs[0, :].tolist(), shrink=0.82)
-            cb.set_label("n" if quantity == "n" else "|E|² (norm.)", color=THEME["text"])
-            cb.ax.yaxis.set_tick_params(color=THEME["text_muted"], labelcolor=THEME["text_muted"])
-
-        fig.set_layout_engine("constrained")
-        if first_export:
-            pname, y, z, mat = first_export
-            self._store_grid_export(f"Stored {quantity} for {pname}", y, z, [(quantity, mat)])
-
-    def _plot_simulated_port_fields(self, fig: Figure, port_sel: str, k_freq: int, lam: np.ndarray):
+    def _plot_simulated_port_fields(self, fig: Figure, port_sel: str, k_freq: int):
         """|E|² recorded in the y-z planes of the ports and field monitors, from the .h5 file or
         from the .fsp itself (read one frequency at a time)."""
+        lam = self.model.get_frequencies_and_wavelengths()[1]
         planes = self.model.field_planes()
         if not planes:
             raise RuntimeError("No recorded field in any port or monitor plane: the project holds no "
                                "results, and no matching .h5 file is open.")
         if port_sel in planes:
             show = [port_sel]
-        elif port_sel and port_sel != "All Ports":
+        elif port_sel and port_sel != ALL_OBJECTS:
             raise RuntimeError(f"'{port_sel}' has no recorded field. Planes with fields: {', '.join(planes)}")
         elif len(planes) > 8:
             show = [planes[i] for i in np.linspace(0, len(planes) - 1, 8).astype(int)]
@@ -5371,9 +5500,12 @@ class FSPGuiApp:
                 [("E2_norm", mat)],
             )
 
-    def _plot_plane_power(self, fig: Figure, port_sel: str, k_freq: int, lam: np.ndarray):
+    def _plot_plane_power(self, fig: Figure, port_sel: str, k_freq: int):
         """Power through the port and field monitor planes along x, relative to the first plane:
-        at the chosen wavelength, and (when the planes store their power spectrum) against λ."""
+        at the chosen wavelength, and (when the planes store their power spectrum) against λ.
+        Where a plane has a stored mode (its own, or of a port at the same x), the power in the
+        first mode is marked too (open diamond)."""
+        lam = self.model.get_frequencies_and_wavelengths()[1]
         planes = []
         for name in self.model.field_planes():
             pw = self.model.plane_power(name, k_freq)
@@ -5408,13 +5540,28 @@ class FSPGuiApp:
                     markeredgecolor="#ffffff" if name == port_sel else "none")
             a1.annotate(name, (x, r), textcoords="offset points", xytext=(0, 9 if i % 2 == 0 else -16),
                         ha="center", fontsize=7.5, color=THEME["text_muted"])
+        mode_pts = []  # power in the first stored mode of the planes that have one (T_forward)
+        if ps is not None:
+            for name, x, _ in planes:
+                owners = self.model.plane_mode_owners(name)
+                ex = self.model.plane_expansion(name, owners[0], 0) if owners else None
+                if ex is not None and ex["T_forward"] is not None:
+                    mode_pts.append((name, x, float(ex["T_forward"][k_freq]), ex))
+        if mode_pts:
+            a1.plot([x for _, x, _, _ in mode_pts], [t for _, _, t, _ in mode_pts], "D", ms=9, mfc="none",
+                    mec=THEME["warning"], mew=1.4,
+                    label=f"in mode {mode_pts[0][3]['mode_number']} (n_eff={mode_pts[0][3]['neff']:.4f}) of the port at that x")
+            a1.legend(fontsize=7.5, facecolor="#1a1e25", edgecolor=THEME["border"], labelcolor=THEME["text"], loc="lower left")
         a1.set_xlabel("x (μm)")
         a1.set_ylabel(f"P / P({ref_name})")
         a1.set_title(f"Power through the planes along x, λ = {lam[k_freq]:.1f} nm", fontsize=10)
         a1.grid(alpha=0.25, color=THEME["grid_axis"])
         a1.set_ylim(bottom=0, top=max(1.1, max(rel) * 1.15))
 
-        rows = ["plane\tx_um\tP_over_P_first"] + [f"{n}\t{x:.4f}\t{r:.6g}" for (n, x, _), r in zip(planes, rel)]
+        in_mode = {n: t for n, _, t, _ in mode_pts}
+        rows = ["plane\tx_um\tP_over_P_first\tT_forward_mode1"] + [
+            f"{n}\t{x:.4f}\t{r:.6g}\t{in_mode[n]:.6g}" if n in in_mode else f"{n}\t{x:.4f}\t{r:.6g}\t"
+            for (n, x, _), r in zip(planes, rel)]
         if has_spectra:
             a2 = axs[1]
             _, lam_all, _ = self.model.get_frequencies_and_wavelengths()
@@ -5437,82 +5584,14 @@ class FSPGuiApp:
         self.last_exported_tsv = "\n".join(rows)
         self.last_exported_desc = f"Power through {len(planes)} planes, lambda={lam[k_freq]:.1f} nm"
 
-    def _spectrum_target(self, port_sel):
-        """The plane(s) whose spectrum is shown: the selected port / field monitor, or for a mode
-        expansion monitor the field plane at its x; all planes for 'All Ports'."""
-        planes = self.model.field_planes()
-        if not planes:
-            raise RuntimeError("No port or monitor plane holds a recorded field or power.")
-        if not port_sel or port_sel == "All Ports":
-            return planes
-        if port_sel in planes:
-            return [port_sel]
-        mm = next((m for m in self.model.mode_monitors if m["name"] == port_sel), None)
-        if mm is not None:
-            same_x = [n for n in planes if abs(self.model.plane_grid(n)[0] - mm["x"]) < 0.05]
-            if same_x:
-                return same_x[:1]
-        raise RuntimeError(f"'{port_sel}' has no recorded field or power. Planes with data: {', '.join(planes)}")
-
-    def _plot_plane_spectrum(self, fig: Figure, port_sel: str, k_freq: int, lam: np.ndarray):
-        """Transmission P / P_source of the selected plane (or of all planes) against wavelength,
-        with the part in the stored mode of the plane where there is one."""
-        names = self._spectrum_target(port_sel)
-        _, lam_all, _ = self.model.get_frequencies_and_wavelengths()
-        order = np.argsort(lam_all)
-        lam_s = lam_all[order]
-        pref = self.model.power_reference()
-        if pref is None:
-            raise RuntimeError("Neither a source power nor a plane at the source to normalise the powers to.")
-        a1, a2 = fig.subplots(1, 2)
-        self._style_mpl_axes([a1, a2])
-        cmap = matplotlib.colormaps["viridis"]
-        ref_label = f"P / {pref[1]}"
-        header = ["wavelength_nm"]
-        cols = []
-        for i, name in enumerate(names):
-            T = self.model.plane_transmission(name)
-            if T is None:
-                continue
-            color = cmap(i / max(1, len(names) - 1)) if len(names) > 1 else THEME["monitor_cyan"]
-            x = self.model.plane_grid(name)[0]
-            a1.plot(lam_s, T[order], lw=1.8, color=color, label=f"{name} (x={x:.4g} μm)")
-            a2.plot(lam_s, 10 * np.log10(np.clip(T[order], 1e-12, None)), lw=1.8, color=color, label=name)
-            header.append(f"{name}_P_over_{'Psource' if pref[2] else 'Pref'}")
-            cols.append(T[order])
-            mt = self.model.plane_mode_transmission(name)
-            if mt is not None and mt[2] is not None:
-                a1.plot(lam_s, mt[2][order], ls="--", lw=1.4, color=color, label=f"{name}: in mode of {mt[0]}")
-                a2.plot(lam_s, 10 * np.log10(np.clip(mt[2][order], 1e-12, None)), ls="--", lw=1.4, color=color)
-                header.append(f"{name}_mode_{mt[0]}")
-                cols.append(mt[2][order])
-        if not cols:
-            raise RuntimeError("The selected plane holds no power spectrum (no 'power' result, and no E and H fields).")
-        for ax in (a1, a2):
-            ax.axvline(lam[k_freq], color=THEME["text_dim"], ls=":", lw=1)
-            ax.set_xlabel("Wavelength λ (nm)")
-            ax.grid(alpha=0.25, color=THEME["grid_axis"])
-        a1.set_ylabel(ref_label)
-        a1.set_ylim(bottom=0)
-        a1.set_title("Solid: all power · dashed: in the stored mode", fontsize=9.5)
-        a2.set_ylabel(f"{ref_label} (dB)")
-        a2.set_title("Transmission (dB)", fontsize=9.5)
-        a1.legend(fontsize=7.5, facecolor="#1a1e25", edgecolor=THEME["border"], labelcolor=THEME["text"], loc="best")
-        note = "" if pref[2] else f"  (relative to {pref[1][2:-1]}: the field file has no absolute power scale)"
-        fig.suptitle(f"Power spectrum through {names[0] if len(names) == 1 else f'{len(names)} planes'}{note}",
-                     color=THEME["text"], fontsize=10.5, fontweight="bold")
-        fig.set_layout_engine("constrained")
-        rows = ["\t".join(header)] + ["\t".join([f"{l:.3f}"] + [f"{c[j]:.6g}" for c in cols]) for j, l in enumerate(lam_s)]
-        self.last_exported_tsv = "\n".join(rows)
-        self.last_exported_desc = f"Power spectrum ({len(cols)} curves x {len(lam_s)} wavelengths)"
-
-    def _plot_s_parameters(self, fig: Figure, k_freq: int, lam: np.ndarray):
+    def _plot_s_parameters(self, fig: Figure, k_freq: int):
         """|S_i1|^2 of every plane from the stored powers: P_i / P_source (all modes) and, where the
         plane has a stored mode, the power in that mode; S11 estimated from the power balance."""
         pref = self.model.power_reference()
         if pref is None:
             raise RuntimeError("The project stores no source power spectrum (P0 of the source) and no plane "
                                "at the source: S-parameters cannot be normalised.")
+        lam = self.model.get_frequencies_and_wavelengths()[1]
         absolute = pref[2]
         ref_plane = None if absolute else pref[1][2:-1]
         planes = [n for n in self.model.field_planes() if self.model.plane_transmission(n) is not None]
@@ -5536,12 +5615,14 @@ class FSPGuiApp:
             a1.plot(lam_s, 10 * np.log10(np.clip(T[order], 1e-12, None)), lw=1.6, color=color, label=f"{name} (x={x:.4g} μm)")
             header += [f"|S|^2_{name}", f"|S|_{name}"]
             cols += [T[order], np.sqrt(np.clip(T[order], 0, None))]
-            mt = self.model.plane_mode_transmission(name)
-            if mt is not None and mt[2] is not None:
-                a2.plot(lam_s, 10 * np.log10(np.clip(mt[2][order], 1e-12, None)), lw=1.8, color=color,
-                        label=f"{name} → mode of {mt[0]}")
+            owners = self.model.plane_mode_owners(name)
+            ex = self.model.plane_expansion(name, owners[0], 0) if owners else None
+            if ex is not None and ex["T_forward"] is not None:
+                tf = ex["T_forward"][order]
+                a2.plot(lam_s, 10 * np.log10(np.clip(tf, 1e-12, None)), lw=1.8, color=color,
+                        label=f"{name} → mode {ex['mode_number']} of {ex['owner']}")
                 header += [f"|S|^2_mode_{name}", f"|S|_mode_{name}"]
-                cols += [mt[2][order], np.sqrt(np.clip(mt[2][order], 0, None))]
+                cols += [tf, np.sqrt(np.clip(tf, 0, None))]
         if downstream and x_src is not None and absolute:
             # power balance at the first plane after the source: P = P_source - P_reflected
             first = downstream[0]
@@ -5566,153 +5647,6 @@ class FSPGuiApp:
         rows = ["\t".join(header)] + ["\t".join([f"{l:.3f}"] + [f"{c[j]:.6g}" for c in cols]) for j, l in enumerate(lam_s)]
         self.last_exported_tsv = "\n".join(rows)
         self.last_exported_desc = f"S-parameter magnitudes ({len(cols)} columns x {len(lam_s)} wavelengths)"
-
-    def _plot_power_and_mode_coupling(self, fig: Figure, port_sel: str):
-        xs, freqs, lam, P, Prel, eta, Tmode = self.model.compute_power_and_mode_coupling()
-        a1, a2 = fig.subplots(1, 2)
-        self._style_mpl_axes([a1, a2])
-
-        start_idx = 1 if len(xs) > 1 else 0
-        shown = range(len(freqs)) if len(freqs) <= 9 else np.unique(np.linspace(0, len(freqs) - 1, 7).round().astype(int))
-        for k in shown:  # at most 7 wavelengths of a long list, to keep the legend readable
-            a1.plot(xs[start_idx:], Prel[start_idx:, k], "o-", label=f"{lam[k]:.0f} nm", lw=1.8, markersize=5)
-            a2.plot(xs[start_idx:], Tmode[start_idx:, k], "s-", label=f"{lam[k]:.0f} nm", lw=1.8, markersize=5)
-
-        # Highlight selected port with vertical yellow line if a specific port is selected
-        for pt in self.model.ports:
-            if pt["name"] == port_sel:
-                for ax in (a1, a2):
-                    ax.axvline(pt["x"], color=THEME["port_yellow"], ls="--", lw=1.5, label=f"Selected: {pt['name']}")
-
-        a1.set_title("Total forward power / input power (P / Pin)", fontsize=10)
-        a1.set_xlabel("x (μm)")
-        a1.set_ylabel("P / Pin")
-        a1.legend(fontsize=8, facecolor="#1a1e25", edgecolor=THEME["border"], labelcolor=THEME["text"])
-        a1.grid(alpha=0.25, color=THEME["grid_axis"])
-
-        a2.set_title("Power in stored port mode / input power (Tmode)", fontsize=10)
-        a2.set_xlabel("x (μm)")
-        a2.set_ylabel("Tmode")
-        a2.legend(fontsize=8, facecolor="#1a1e25", edgecolor=THEME["border"], labelcolor=THEME["text"])
-        a2.grid(alpha=0.25, color=THEME["grid_axis"])
-
-        fig.set_layout_engine("constrained")
-
-        # Build export table matching port_power_table.txt from fsp_plots.py
-        header_cols = (
-            ["x_um", "port"]
-            + [f"P/Pin@{l:.1f}nm" for l in lam]
-            + [f"mode/Pin@{l:.1f}nm" for l in lam]
-        )
-        rows = ["\t".join(header_cols)]
-        for i, pt in enumerate(self.model.ports):
-            vals = [f"{xs[i]:.4f}", pt["name"]]
-            vals += [f"{v:.6f}" for v in Prel[i]]
-            vals += [f"{v:.6f}" for v in Tmode[i]]
-            rows.append("\t".join(vals))
-        self.last_exported_tsv = "\n".join(rows)
-        self.last_exported_desc = f"Port Power & Mode Coupling Table ({len(self.model.ports)} ports × {len(lam)} λ)"
-
-    def _plot_transmission_vs_wavelength(self, fig: Figure, port_sel: str):
-        xs, freqs, lam, P, Prel, eta, Tmode = self.model.compute_power_and_mode_coupling()
-        a1, a2 = fig.subplots(1, 2)
-        self._style_mpl_axes([a1, a2])
-
-        order = np.argsort(lam)
-        lam_s = lam[order]
-
-        if port_sel != "All Ports":
-            indices = [i for i, pt in enumerate(self.model.ports) if pt["name"] == port_sel]
-        else:
-            indices = list(range(1, len(self.model.ports))) if len(self.model.ports) > 1 else [0]
-        indices = [i for i in indices if np.isfinite(Prel[i]).any()]  # ports that recorded a field
-        if not indices:
-            raise RuntimeError(f"{'This port has' if port_sel != 'All Ports' else 'The ports have'} no recorded "
-                               "field in the .h5 file (a disabled port records nothing).")
-
-        rows = ["wavelength_nm\tport\tx_um\tP_over_Pin\tTmode_over_Pin\tInsertionLoss_dB"]
-        for i in indices:
-            pname = self.model.ports[i]["name"]
-            p_lin = Prel[i, order]
-            t_lin = Tmode[i, order]
-            t_db = 10.0 * np.log10(np.clip(t_lin, 1e-12, None))
-            a1.plot(lam_s, p_lin, "o--", alpha=0.7, label=f"{pname} P/Pin")
-            a1.plot(lam_s, t_lin, "s-", lw=2.0, label=f"{pname} Mode T")
-            a2.plot(lam_s, t_db, "s-", lw=2.0, label=f"{pname} (x={xs[i]:g} μm)")
-            for l_val, pv, tv, dbv in zip(lam_s, p_lin, t_lin, t_db):
-                rows.append(f"{l_val:.2f}\t{pname}\t{xs[i]:.3f}\t{pv:.6f}\t{tv:.6f}\t{dbv:.4f}")
-
-        a1.set_title("Linear Transmission vs. Wavelength λ", fontsize=10)
-        a1.set_xlabel("Wavelength λ (nm)")
-        a1.set_ylabel("Transmission (linear)")
-        a1.grid(alpha=0.25, color=THEME["grid_axis"])
-        a1.legend(fontsize=8, facecolor="#1a1e25", edgecolor=THEME["border"], labelcolor=THEME["text"])
-
-        a2.set_title("Mode Coupling Transmission (dB) vs. Wavelength λ", fontsize=10)
-        a2.set_xlabel("Wavelength λ (nm)")
-        a2.set_ylabel("Mode Coupling (dB)")
-        a2.grid(alpha=0.25, color=THEME["grid_axis"])
-        a2.legend(fontsize=8, facecolor="#1a1e25", edgecolor=THEME["border"], labelcolor=THEME["text"])
-
-        fig.set_layout_engine("constrained")
-        self.last_exported_tsv = "\n".join(rows)
-        self.last_exported_desc = f"Port Transmission Spectrum ({len(indices)} ports × {len(lam_s)} wavelengths)"
-
-    def _plot_xz_propagation(self, fig: Figure, k_freq: int, lam: np.ndarray):
-        if self.model.h5 is None:
-            raise RuntimeError("Companion .h5 file is required to plot XZ propagation fields.")
-        def is_xz(grp):  # a y-normal plane: many x, one y
-            try:
-                g = self.model.h5[grp]
-                return g["x"].size > 1 and g["y"].size == 1 and g["z"].size > 1 and "Ex" in g
-            except Exception:
-                return False
-        mon_info = self.model.dft_monitors.get("dft_xz_propagation")
-        h5_grp = mon_info["h5_group"] if mon_info and mon_info["h5_group"] else None
-        if not h5_grp or not is_xz(h5_grp):
-            h5_grp = next((g for g in self.model.h5 if is_xz(g)), None)
-        if h5_grp is None:
-            raise RuntimeError("The .h5 file holds no XZ field monitor (a y-normal plane): the XZ monitor "
-                               "was disabled or not recorded.")
-
-        g = self.model.h5[h5_grp]
-        x, z = g["x"][()], g["z"][()]
-        axs = fig.subplots(2, 1)
-        self._style_mpl_axes(axs)
-
-        E2 = sum(np.abs(self.model.h5_field(h5_grp, c, k_freq)[:, 0, :]) ** 2 for c in ("Ex", "Ey", "Ez"))
-        dB = 10.0 * np.log10(E2 / max(float(E2.max()), 1e-30) + 1e-12)
-
-        for ax, xr, title_suffix in (
-            (axs[0], None, "Full device"),
-            (axs[1], (185.0, float(x[-1])) if x[-1] > 190 else None, "Tip & output ports zoom"),
-        ):
-            sel = slice(None) if xr is None else (x >= xr[0]) & (x <= xr[1])
-            im = self._colormesh(ax, x[sel], z, dB[:, sel], shading="auto", cmap="inferno", vmin=-35, vmax=0, rasterized=True)
-            # Draw yellow port lines on top of XZ field
-            for pt in self.model.ports:
-                if xr is None or (xr[0] <= pt["x"] <= xr[1]):
-                    ax.axvline(pt["x"], color=THEME["port_yellow"], ls="--", lw=1.2)
-            ax.set_ylabel("z (μm)")
-            ax.set_title(f"|E|² at y = 0 (dB), λ = {lam[k_freq]:.1f} nm — {title_suffix}", fontsize=9.5)
-            ax.set_xlim(*(xr or (x[0], x[-1])))
-
-        axs[-1].set_xlabel("x (μm)")
-        cb = fig.colorbar(im, ax=axs.tolist(), shrink=0.75, label="dB")
-        cb.set_label("dB", color=THEME["text"])
-        cb.ax.yaxis.set_tick_params(color=THEME["text_muted"], labelcolor=THEME["text_muted"])
-        fig.set_layout_engine("constrained")
-
-        # Subsample x if very large (>500 cols) for responsive clipboard export
-        step = max(1, len(x) // 400)
-        self._store_grid_export(
-            f"XZ Propagation |E|^2 (dB) at y=0, lambda={lam[k_freq]:.1f} nm",
-            x[::step],
-            z,
-            [("E2_dB", dB[:, ::step])],
-            u_name="x_um",
-            v_name="z_um",
-        )
 
     def _plot_layout_top_view(self, fig: Figure, port_sel: str):
         a1, a2 = fig.subplots(2, 1, gridspec_kw={"height_ratios": [1.35, 1.0]})
@@ -5785,38 +5719,17 @@ class FSPGuiApp:
         self.last_exported_tsv = "\n".join(rows)
         self.last_exported_desc = "Top-View Geometry Polygons & Port Coordinates"
 
-    def _plot_port_field_components(self, fig: Figure, port_sel: str, k_freq: int, lam: np.ndarray):
-        target = self._get_target_ports(max_all=1)[0]
-        y, z, M, neff, _ = self.model.stored_mode(target)
-        axs = fig.subplots(2, 3)
-        self._style_mpl_axes(axs)
+    def _source_object(self, port_name):
+        """The stored source of a port (its '<port> Mode Source', with time_signal), or None."""
+        pt = next((p for p in self.model.ports if p["name"] == port_name), None)
+        ob = pt.get("mode_src_obj") if pt else None
+        return ob if ob is not None and "time" in ob.results and "time_signal" in ob.results else None
 
-        comps = [("Ex", axs[0, 0]), ("Ey", axs[0, 1]), ("Ez", axs[0, 2]),
-                 ("Hx", axs[1, 0]), ("Hy", axs[1, 1]), ("Hz", axs[1, 2])]
-        export_list = []
-        for cname, ax in comps:
-            arr = np.abs(M[cname])
-            im = self._colormesh(ax, y, z, arr, shading="auto", cmap="magma")
-            ax.set_title(f"|{cname}| ({target})", fontsize=9)
-            ax.set_aspect("equal")
-            ax.set_xlabel("y (μm)")
-            ax.set_ylabel("z (μm)")
-            cb = fig.colorbar(im, ax=ax, shrink=0.78)
-            cb.ax.yaxis.set_tick_params(color=THEME["text_muted"], labelcolor=THEME["text_muted"])
-            export_list.append((f"abs_{cname}", arr))
-
-        fig.suptitle(f"Stored Mode Field Components for {target}", color=THEME["text"], fontsize=10.5, fontweight="bold")
-        fig.set_layout_engine("constrained")
-        self._store_grid_export(f"Mode Field Components for {target}", y, z, export_list)
-
-    def _plot_source_pulse(self, fig: Figure):
-        src_ob = None
-        for ob in self.model.fsp.objects:
-            if "time" in ob.results and "time_signal" in ob.results:
-                src_ob = ob
-                break
+    def _plot_source_pulse(self, fig: Figure, port_name):
+        """The stored time signal of the source of a port, and its stored P0 against λ."""
+        src_ob = self._source_object(port_name)
         if src_ob is None:
-            raise RuntimeError("No Mode Source time-domain signal stored in this .fsp file.")
+            raise RuntimeError(f"No time signal of the source of {port_name} is stored in this .fsp file.")
 
         t_fs = src_ob.results["time"].ravel() * 1e15
         sig = src_ob.results["time_signal"].ravel()
@@ -5849,6 +5762,352 @@ class FSPGuiApp:
             rows.append(f"{tv:.4f}\t{ float(np.real(sv)):.6e}\t{float(np.imag(sv)):.6e}")
         self.last_exported_tsv = "\n".join(rows)
         self.last_exported_desc = f"Source Time Pulse ({len(t_fs)} samples)"
+
+    # ------------------------------------------------------------------
+    # Results of One Object (named as in Lumerical)
+    # ------------------------------------------------------------------
+    def _legend(self, ax, **kw):
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(**dict(dict(fontsize=7.5, facecolor="#1a1e25", edgecolor=THEME["border"],
+                                  labelcolor=THEME["text"], loc="best", framealpha=0.85), **kw))
+
+    @staticmethod
+    def _mirror_y(y, A):
+        """A field recorded in a symmetric simulation (only y >= 0) on the whole y range."""
+        if y[0] >= -1e-6 and len(y) > 1:
+            return np.concatenate([-y[:0:-1], y]), np.concatenate([A[:, :0:-1], A], axis=1)
+        return y, A
+
+    @staticmethod
+    def _zoom_to_field(axs, y, z, A, frac=1e-3, pad=0.6):
+        """Show only the part of the plane where the field is (above frac of its peak, with a margin
+        of pad um), when that is clearly smaller than the plane; the data stays whole."""
+        rows, cols = np.nonzero(np.abs(A) > frac * float(np.abs(A).max()))
+        if not rows.size:
+            return
+        y0, y1 = y[cols.min()] - pad, y[cols.max()] + pad
+        z0, z1 = z[rows.min()] - pad, z[rows.max()] + pad
+        if (y1 - y0) < 0.7 * (y[-1] - y[0]) or (z1 - z0) < 0.7 * (z[-1] - z[0]):
+            for ax in axs:
+                ax.set_xlim(max(y0, y[0]), min(y1, y[-1]))
+                ax.set_ylim(max(z0, z[0]), min(z1, z[-1]))
+
+    def _index_contour(self, ax, plane):
+        """Outline the materials (stored refractive index) of the port at the plane's x."""
+        owners = self.model.plane_mode_owners(plane)
+        if not owners:
+            return
+        try:
+            ys, zs, M, _, _ = self.model.stored_mode(owners[0])
+            ax.contour(ys, zs, M["n"], levels=[1.2, 1.445, 1.7, 2.5], colors="w", linewidths=0.5, alpha=0.7)
+        except Exception:
+            pass
+
+    def _plot_plane_field(self, fig: Figure, name, quantity, k):
+        """E or H (|E|² and its components) or P (the Poynting vector) recorded in a y-z plane."""
+        m = self.model
+        x, y, z = m.plane_grid(name)
+        lam = m.plane_wavelength(name, k)
+        if quantity == "P":
+            F = {c: m.plane_field(name, c, k) for c in ("Ex", "Ey", "Ez", "Hx", "Hy", "Hz")}
+            s = m.h_scale(name)
+            Hc = {c: np.conj(F[c]) / s for c in ("Hx", "Hy", "Hz")}
+            P = {"Px": 0.5 * np.real(F["Ey"] * Hc["Hz"] - F["Ez"] * Hc["Hy"]),
+                 "Py": 0.5 * np.real(F["Ez"] * Hc["Hx"] - F["Ex"] * Hc["Hz"]),
+                 "Pz": 0.5 * np.real(F["Ex"] * Hc["Hy"] - F["Ey"] * Hc["Hx"])}
+            big = max(float(np.abs(v).max()) for v in P.values()) or 1.0
+            panels = [(c, v / big) for c, v in P.items()]
+            axs = fig.subplots(1, 3, squeeze=False).ravel()
+            cmap, vmin, vmax, cb_label = "coolwarm", -1.0, 1.0, "P / max |P|"
+        else:
+            comps = [c for c in (quantity + "x", quantity + "y", quantity + "z") if m.plane_has(name, c)]
+            F2 = {c: np.abs(m.plane_field(name, c, k)) ** 2 for c in comps}
+            total = sum(F2.values())
+            big = float(total.max()) or 1.0
+            panels = [(f"|{quantity}|²", total / big)] + [(f"|{c}|²", F2[c] / big) for c in comps]
+            axs = fig.subplots(2, 2, squeeze=False).ravel()
+            cmap, vmin, vmax, cb_label = "inferno", 0.0, 1.0, f"/ max |{quantity}|²"
+        self._style_mpl_axes(list(axs))
+        for ax in axs[len(panels):]:
+            ax.set_visible(False)
+        im, export = None, []
+        for ax, (title, A) in zip(axs, panels):
+            yy, AA = self._mirror_y(y, A)
+            im = self._colormesh(ax, yy, z, AA, shading="auto", cmap=cmap, vmin=vmin, vmax=vmax)
+            self._index_contour(ax, name)
+            ax.set_xlim(yy[0], yy[-1])
+            ax.set_ylim(z[0], z[-1])
+            ax.set_aspect("equal")
+            ax.set_title(title, fontsize=9.5)
+            ax.set_xlabel("y (μm)")
+            ax.set_ylabel("z (μm)")
+            export.append((title.replace("|", "abs_").replace("²", "2"), AA))
+        yy, _ = self._mirror_y(y, panels[0][1])
+        extent = sum(np.abs(A) for _, A in panels)
+        self._zoom_to_field(axs[:len(panels)], yy, z, self._mirror_y(y, extent)[1])
+        cb = fig.colorbar(im, ax=list(axs[:len(panels)]), shrink=0.8)
+        cb.set_label(cb_label, color=THEME["text"])
+        cb.ax.yaxis.set_tick_params(color=THEME["text_muted"], labelcolor=THEME["text_muted"])
+        fig.suptitle(f"{self._lum_name(name)} › {quantity}    λ = {lam:.1f} nm, x = {x:.4g} μm",
+                     color=THEME["text"], fontsize=10.5, fontweight="bold")
+        fig.set_layout_engine("constrained")
+        yy, _ = self._mirror_y(y, panels[0][1])
+        self._store_grid_export(f"{self._lum_name(name)} {quantity}, lambda={lam:.2f} nm", yy, z, export)
+
+    def _plot_plane_T(self, fig: Figure, name, k):
+        """T of a plane against λ, linear and in dB; dashed: the part in each stored mode of the port
+        at the plane (T_forward)."""
+        m = self.model
+        T = m.plane_transmission(name)
+        pref = m.power_reference()
+        if T is None or pref is None:
+            raise RuntimeError("The plane holds no power spectrum, or there is nothing to normalise it to.")
+        lam = m.get_frequencies_and_wavelengths()[1]
+        order = np.argsort(lam)
+        lam_s = lam[order]
+        a1, a2 = fig.subplots(1, 2)
+        self._style_mpl_axes([a1, a2])
+        header, cols = ["wavelength_nm", "T"], [T[order]]
+        a1.plot(lam_s, T[order], lw=2, color=THEME["monitor_cyan"], label="T (all power through the plane)")
+        a2.plot(lam_s, 10 * np.log10(np.clip(T[order], 1e-12, None)), lw=2, color=THEME["monitor_cyan"], label="T")
+        colors = ["#ffd700", "#ff922b", "#c7a8ff", "#7ee2b0"]
+        i = 0
+        for owner in m.plane_mode_owners(name):
+            for mode, (num, neff) in enumerate(m.stored_modes(owner)):
+                ex = m.plane_expansion(name, owner, mode)
+                if ex is None or ex["T_forward"] is None or not np.nanmax(ex["T_forward"]) > 1e-6:
+                    continue
+                tf = ex["T_forward"][order]
+                lbl = f"in mode {num} of {owner} (n_eff={neff:.4f})"
+                a1.plot(lam_s, tf, ls="--", lw=1.6, color=colors[i % 4], label=lbl)
+                a2.plot(lam_s, 10 * np.log10(np.clip(tf, 1e-12, None)), ls="--", lw=1.6, color=colors[i % 4], label=lbl)
+                header.append(f"T_forward_mode{num}_{owner}")
+                cols.append(tf)
+                i += 1
+        for ax in (a1, a2):
+            ax.axvline(lam[k], color=THEME["text_dim"], ls=":", lw=1)
+            ax.set_xlabel("Wavelength λ (nm)")
+            ax.grid(alpha=0.25, color=THEME["grid_axis"])
+        a1.set_ylabel("T")
+        a2.set_ylabel("T (dB)")
+        self._legend(a1)
+        norm = (f"T = P / {pref[1]}" if pref[2] else
+                f"T = P / {pref[1]} (the power injected by the source; the .h5 fields are normalised to the source spectrum)")
+        a1.set_title(norm if pref[2] else f"T = P / {pref[1]}", fontsize=9.5)
+        a2.set_title("in dB", fontsize=9.5)
+        fig.suptitle(f"{self._lum_name(name)} › T", color=THEME["text"], fontsize=10.5, fontweight="bold")
+        fig.set_layout_engine("constrained")
+        self._store_columns(f"{self._lum_name(name)} T ({norm})", lam_s, header, cols)
+
+    def _plot_expansion(self, fig: Figure, name, owner, k):
+        """T_forward (towards +x) and T_backward (towards -x) of each stored mode of `owner` in the
+        field recorded in the plane `name`."""
+        m = self.model
+        lam = m.get_frequencies_and_wavelengths()[1]
+        order = np.argsort(lam)
+        lam_s = lam[order]
+        a1, a2 = fig.subplots(1, 2)
+        self._style_mpl_axes([a1, a2])
+        header, cols = ["wavelength_nm"], []
+        T = m.plane_transmission(name)
+        if T is not None:
+            a1.plot(lam_s, T[order], color=THEME["text_muted"], lw=1.2, ls=":", label="T (all power)")
+        colors = ["#ffd700", "#ff922b", "#c7a8ff", "#7ee2b0"]
+        for mode, (num, neff) in enumerate(m.stored_modes(owner)):
+            ex = m.plane_expansion(name, owner, mode)
+            if ex is None or ex["T_forward"] is None:
+                continue
+            tf, tb = ex["T_forward"][order], ex["T_backward"][order]
+            c = colors[mode % 4]
+            a1.plot(lam_s, tf, color=c, lw=1.8, label=f"T_forward, mode {num} (n_eff={neff:.4f})")
+            a2.plot(lam_s, 10 * np.log10(np.clip(tf, 1e-10, None)), color=c, lw=1.8, label=f"T_forward, mode {num}")
+            a2.plot(lam_s, 10 * np.log10(np.clip(tb, 1e-10, None)), color=c, lw=1.4, ls="--", label=f"T_backward, mode {num}")
+            header += [f"T_forward_mode{num}", f"T_backward_mode{num}"]
+            cols += [tf, tb]
+        if not cols:
+            raise RuntimeError(f"The field in {name} could not be expanded on the modes of {owner}.")
+        for ax in (a1, a2):
+            ax.axvline(lam[k], color=THEME["text_dim"], ls=":", lw=1)
+            ax.set_xlabel("Wavelength λ (nm)")
+            ax.grid(alpha=0.25, color=THEME["grid_axis"])
+            self._legend(ax)
+        a1.set_ylabel("T")
+        a2.set_ylabel("T (dB)")
+        a2.set_ylim(bottom=max(-100, a2.get_ylim()[0]))
+        pref = m.power_reference()
+        a1.set_title(f"Power in the modes / {pref[1] if pref else 'reference'}  (forward: +x)", fontsize=9.5)
+        a2.set_title("in dB (dashed: towards −x)", fontsize=9.5)
+        is_port = owner == name and any(pt["name"] == name for pt in m.ports)
+        title = (f"{self._lum_name(name)} › expansion for port monitor" if is_port
+                 else f"{name}: expansion on the modes of {self._lum_name(owner)}")
+        fig.suptitle(title, color=THEME["text"], fontsize=10.5, fontweight="bold")
+        fig.set_layout_engine("constrained")
+        self._store_columns(title, lam_s, header, cols)
+
+    def _plot_mode_profiles(self, fig: Figure, owner):
+        """The stored refractive index and the |E|² of each stored mode of a port / mode monitor."""
+        m = self.model
+        modes = m.stored_modes(owner)[:4]
+        axs = fig.subplots(1, 1 + len(modes), squeeze=False).ravel()
+        self._style_mpl_axes(list(axs))
+        y, z, M, _, mode_lam = m.stored_mode(owner, 0)
+        im_n = self._colormesh(axs[0], y, z, M["n"], shading="auto", cmap="viridis")
+        axs[0].set_title("index n", fontsize=9.5)
+        export = [("n", M["n"])]
+        im_e = None
+        for j, (num, neff) in enumerate(modes, start=1):
+            _, _, Mj, _, _ = m.stored_mode(owner, j - 1)
+            E2 = sum(np.abs(Mj[f"E{c}"]) ** 2 for c in "xyz")
+            E2 = E2 / max(float(E2.max()), 1e-300)
+            im_e = self._colormesh(axs[j], y, z, E2, shading="auto", cmap="inferno", vmin=0.0, vmax=1.0)
+            axs[j].contour(y, z, M["n"], levels=[1.2, 1.445, 1.7, 2.5], colors="w", linewidths=0.5, alpha=0.7)
+            axs[j].set_title(f"mode {num}: |E|², n_eff = {neff:.4f}" if neff else f"mode {num}: |E|²", fontsize=9.5)
+            export.append((f"E2_mode{num}", E2))
+        self._zoom_to_field(axs, y, z, sum(A for name, A in export[1:]))
+        for ax in axs:
+            ax.set_aspect("equal")
+            ax.set_xlabel("y (μm)")
+        axs[0].set_ylabel("z (μm)")
+        for im, ax, label in ((im_n, axs[0], "n"), (im_e, list(axs[1:]), "|E|² (norm.)")):
+            if im is not None:
+                cb = fig.colorbar(im, ax=ax, shrink=0.7)
+                cb.set_label(label, color=THEME["text"])
+                cb.ax.yaxis.set_tick_params(color=THEME["text_muted"], labelcolor=THEME["text_muted"])
+        at = f" (calculated at λ = {mode_lam:.1f} nm)" if mode_lam else ""
+        fig.suptitle(f"{self._lum_name(owner)} › mode profiles{at}", color=THEME["text"], fontsize=10.5, fontweight="bold")
+        fig.set_layout_engine("constrained")
+        self._store_grid_export(f"{self._lum_name(owner)} mode profiles", y, z, export)
+
+    def _plot_mode_components(self, fig: Figure, owner):
+        """|Ex| .. |Hz| of each stored mode (a row per mode), each normalised to the largest of E or H."""
+        m = self.model
+        modes = m.stored_modes(owner)[:3]
+        axs = fig.subplots(len(modes), 6, squeeze=False)
+        self._style_mpl_axes(axs)
+        export, im, y, z = [], None, None, None
+        for i, (num, neff) in enumerate(modes):
+            y, z, M, _, _ = m.stored_mode(owner, i)
+            for j, c in enumerate(("Ex", "Ey", "Ez", "Hx", "Hy", "Hz")):
+                big = max(float(np.abs(M[c[0] + d]).max()) for d in "xyz") or 1.0
+                A = np.abs(M[c]) / big
+                im = self._colormesh(axs[i, j], y, z, A, shading="auto", cmap="magma", vmin=0.0, vmax=1.0)
+                axs[i, j].set_title(f"|{c}|, mode {num}", fontsize=8.5)
+                axs[i, j].set_aspect("equal")
+                axs[i, j].tick_params(labelsize=7)
+                export.append((f"abs_{c}_mode{num}", A))
+            axs[i, 0].set_ylabel(f"n_eff={neff:.4f}\nz (μm)" if neff else "z (μm)", fontsize=8)
+        self._zoom_to_field(axs.ravel(), y, z, sum(A for _, A in export))
+        for ax in axs[-1]:
+            ax.set_xlabel("y (μm)", fontsize=8)
+        if im is not None:
+            cb = fig.colorbar(im, ax=axs.ravel().tolist(), shrink=0.7)
+            cb.set_label("/ max of E or H of the mode", color=THEME["text"])
+            cb.ax.yaxis.set_tick_params(color=THEME["text_muted"], labelcolor=THEME["text_muted"])
+        fig.suptitle(f"{self._lum_name(owner)} › mode profiles: field components", color=THEME["text"],
+                     fontsize=10.5, fontweight="bold")
+        fig.set_layout_engine("constrained")
+        self._store_grid_export(f"{self._lum_name(owner)} mode field components", y, z, export)
+
+    def _plot_monitor_2d(self, fig: Figure, mon, quantity, k):
+        """|E|² or |H|² recorded by a monitor in a plane along the device (x-y or x-z): in dB and linear."""
+        m = self.model
+        g = m.h5[mon["group"]]
+        comps = [c for c in (quantity + "x", quantity + "y", quantity + "z") if c in g]
+        F2, lam = None, None
+        for c in comps:
+            a, lam = m.monitor_field(mon, c, k)
+            F2 = np.abs(a) ** 2 if F2 is None else F2 + np.abs(a) ** 2
+        u, v = m.monitor_grid(mon)
+        step = max(1, len(u) // 3000)  # enough columns for the screen
+        u_s, F2s = u[::step], F2[:, ::step]
+        F2n = F2s / max(float(F2s.max()), 1e-300)
+        dB = 10 * np.log10(F2n + 1e-12)
+        axs = fig.subplots(2, 1)
+        self._style_mpl_axes(list(axs))
+        ims = [self._colormesh(axs[0], u_s, v, dB, shading="auto", cmap="inferno", vmin=-40, vmax=0, rasterized=True),
+               self._colormesh(axs[1], u_s, v, F2n, shading="auto", cmap="inferno", vmin=0, vmax=1, rasterized=True)]
+        if mon["u"] == "x":
+            for ax in axs:
+                for pt in m.ports:
+                    ax.axvline(pt["x"], color=THEME["port_yellow"], ls="--", lw=1.0)
+                for fm in m.field_monitors:
+                    if fm["has_data"]:
+                        ax.axvline(fm["x"], color=THEME["monitor_cyan"], ls=":", lw=0.8)
+        for ax, im, label in zip(axs, ims, ("dB", "norm.")):
+            ax.set_ylabel(f"{mon['v']} (μm)")
+            cb = fig.colorbar(im, ax=ax, shrink=0.85)
+            cb.set_label(label, color=THEME["text"])
+            cb.ax.yaxis.set_tick_params(color=THEME["text_muted"], labelcolor=THEME["text_muted"])
+        axs[1].set_xlabel(f"{mon['u']} (μm)")
+        missing = [quantity + d for d in "xyz" if quantity + d not in g]
+        note = f" (without {', '.join(missing)}: not recorded)" if missing else ""
+        axs[0].set_title(f"|{quantity}|² in dB{note}", fontsize=9.5)
+        axs[1].set_title(f"|{quantity}|² (linear)", fontsize=9.5)
+        at = float(np.ravel(g[mon["normal"]][()])[0])
+        at = at * 1e6 if abs(at) < 1e-2 and at else at
+        fig.suptitle(f"{mon['name']} › {quantity}    λ = {lam:.1f} nm, {mon['normal']} = {at:.4g} μm" if lam else
+                     f"{mon['name']} › {quantity}", color=THEME["text"], fontsize=10.5, fontweight="bold")
+        fig.set_layout_engine("constrained")
+        es = max(1, len(u) // 400)
+        self._store_grid_export(f"{mon['name']} |{quantity}|^2 (dB)", u[::es], v,
+                                [(f"{quantity}2_dB", 10 * np.log10(F2[:, ::es] / max(float(F2.max()), 1e-300) + 1e-12))],
+                                u_name=f"{mon['u']}_um", v_name=f"{mon['v']}_um")
+
+    def _plot_port_S(self, fig: Figure, k):
+        """|S_ij|² of the port modes (j: the source port, its first mode): the power leaving through
+        each port in each of its modes over the power the source injects, as Lumerical's S-matrix."""
+        m = self.model
+        src = m.source_port()
+        got = m.port_outgoing(src["name"], 0) if src else None
+        if got is None:
+            raise RuntimeError("The source port has no stored mode or no recorded E and H fields.")
+        incident = np.where(got[1] == 0, np.nan, got[1])
+        j = m.ports.index(src) + 1
+        lam = m.get_frequencies_and_wavelengths()[1]
+        order = np.argsort(lam)
+        lam_s = lam[order]
+        a1, a2 = fig.subplots(1, 2)
+        self._style_mpl_axes([a1, a2])
+        header, cols, silent = ["wavelength_nm"], [], []
+        colors = ["#ffd700", "#4c8dff", "#ff922b", "#7ee2b0", "#c7a8ff", "#ff6b6b"]
+        n = 0
+        for i, pt in enumerate(m.ports, start=1):
+            for mode, (num, neff) in enumerate(m.stored_modes(pt["name"])):
+                r = m.port_outgoing(pt["name"], mode)
+                if r is None:
+                    continue
+                S2 = (r[0] / incident)[order]
+                name = f"S{i}{j}" + (f" mode {num}" if len(m.stored_modes(pt["name"])) > 1 else "")
+                header.append(f"|{name.replace(' ', '_')}|^2")
+                cols.append(S2)
+                if not np.nanmax(S2) > 1e-8:
+                    silent.append(name)
+                    continue
+                c = colors[n % len(colors)]
+                n += 1
+                lbl = f"|{name}|²  ({pt['name']}, n_eff={neff:.4f})"
+                a1.plot(lam_s, S2, color=c, lw=1.8, label=lbl)
+                a2.plot(lam_s, 10 * np.log10(np.clip(S2, 1e-12, None)), color=c, lw=1.8, label=lbl)
+        for ax in (a1, a2):
+            ax.axvline(lam[k], color=THEME["text_dim"], ls=":", lw=1)
+            ax.set_xlabel("Wavelength λ (nm)")
+            ax.grid(alpha=0.25, color=THEME["grid_axis"])
+            self._legend(ax)
+        a1.set_ylabel("|S|²")
+        a2.set_ylabel("|S|² (dB)")
+        a1.set_title(f"source: {src['name']} (port {j}), mode {m.stored_modes(src['name'])[0][0]}", fontsize=9.5)
+        a2.set_title("in dB" + (f"; below −80 dB, not drawn: {', '.join(silent)}" if silent else ""), fontsize=9)
+        fig.suptitle(f"{self.PORTS_OBJECT} › S  (|S|² from the expansion of the port fields on the port modes)",
+                     color=THEME["text"], fontsize=10.5, fontweight="bold")
+        fig.set_layout_engine("constrained")
+        self._store_columns(f"{self.PORTS_OBJECT} S", lam_s, header, cols)
+
+    def _store_columns(self, title, lam_s, header, cols):
+        """Columns against wavelength as a tab-separated table for the clipboard."""
+        rows = [f"# {title}", "\t".join(["wavelength_nm"] + [h for h in header if h != "wavelength_nm"])]
+        rows += ["\t".join([f"{lv:.3f}"] + [f"{c[i]:.6g}" for c in cols]) for i, lv in enumerate(lam_s)]
+        self.last_exported_tsv = "\n".join(rows)
+        self.last_exported_desc = f"{title} ({len(cols)} columns x {len(lam_s)} wavelengths)"
 
     def _store_grid_export(self, title, u_arr, v_arr, named_matrices, u_name="y_um", v_name="z_um"):
         """Formats 2D grid data (v_arr × u_arr) into a clean tab-separated table for clipboard export."""
