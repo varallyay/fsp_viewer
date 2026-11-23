@@ -320,6 +320,10 @@ Nodes tagged `1000` (structures and layer-builder internals) start with a partly
 
 ## Version History
 
+### 0.2.8 — 2026-11-23
+- **Fix (Windows): an update could leave the old version in place.** Started from Explorer, the program runs in its own folder, and the helper that swaps in the new version inherited that folder as its current folder; Windows does not rename a folder that a process stands in, so the swap gave up and started the old version again. The helper now runs outside the program folder. Copies of 0.2.7 and older still carry the old helper: replace the folder with the new one from the release `.zip` by hand once (or start the program from a shortcut whose *Start in* is another folder, then update).
+- If a downloaded version cannot be put in place (Windows or macOS), the next start says why, and on Windows the new version is kept next to the program folder (`FSP Viewer.update`).
+
 ### 0.2.7 — 2026-11-20
 - **The Result list is made for the open files**: an **Object** selector (ports, `FDTD::ports`, field monitors, mode expansion monitors and the monitors along the device, e.g. `xz`, `xy_si`) replaces the Port selector, and the **Result** list shows what the object has, named as in Lumerical (`E`, `H`, `P`, `T`, `expansion for port monitor`, `mode profiles`, `S`, and the stored `time_signal`, `P0`), each marked [fsp], [h5] or [calc]; below them the analyses of the whole model.
 - **New results**: the Poynting vector in a plane; the expansion of the recorded field on each stored port mode (T_forward, T_backward); the S-parameters of the port modes (`FDTD::ports` › S); \|E\|² and \|H\|² of any monitor along the device; the mode profiles of every stored mode.

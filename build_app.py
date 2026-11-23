@@ -344,7 +344,13 @@ def test_update_swap(kind, package, work):
     marker = os.path.join(installed, "OLD-VERSION-MARKER")
     open(marker, "w").close()
     stand_in = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"])
-    fsp_gui.start_detached(prepare(package, relaunch=False, pid=stand_in.pid, **target))
+    # Started from Explorer, the program runs in its own folder: the swap must work from there
+    here = os.getcwd()
+    os.chdir(installed)
+    try:
+        fsp_gui.start_detached(prepare(package, relaunch=False, pid=stand_in.pid, **target))
+    finally:
+        os.chdir(here)
     time.sleep(2)
     if not os.path.exists(marker):
         sys.exit("Update test: the program was replaced while it was still running.")

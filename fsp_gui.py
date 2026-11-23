@@ -87,7 +87,7 @@ os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 # Application parameters - edit these to customise the app
 # ======================================================================
 APP_NAME = "FSP Viewer"         # Window title, name of the installed application and (macOS) menu-bar name
-APP_VERSION = "0.2.7"           # See the version history in README.md
+APP_VERSION = "0.2.8"           # See the version history in README.md
 APP_DESCRIPTION = "Lumerical FSP 3D Viewer & Results Analyzer"
 APP_SLUG = "fsp_viewer"         # Folder and file names of the installation
 APP_CLASS = "Fsp_viewer"        # Window class (Linux: connects the windows to the menu entry)
@@ -3346,6 +3346,8 @@ MAIN_FILE = APP_FILES[0]
 FROZEN = bool(getattr(sys, "frozen", False))
 RELEASES_PAGE = APP_WEBSITE + "/releases/latest"
 LOG_FILE = "~/.fsp_viewer.log"  # messages and errors of a packaged application (it has no console)
+# Written by the swap script when a downloaded version could not be put in place; shown at the next start
+UPDATE_FAILED_FILE = "~/.fsp_viewer_update_failed.txt"
 
 
 def load_config():
@@ -3996,8 +3998,12 @@ def prepare_windows_swap(zip_path, files=(), relaunch=True, exe=None, pid=None):
         return "'" + str(text).replace("'", "''") + "'"
 
     args = " ".join('"' + f.replace('"', '') + '"' for f in files if f)
-    start = (f"Start-Process -FilePath (Join-Path $app {ps(exe_name)})"
+    start = (f"Start-Process -FilePath (Join-Path $app {ps(exe_name)}) -WorkingDirectory $app"
              + (f" -ArgumentList {ps(args)}" if args else ""))
+    failed_head = (f"{APP_NAME} could not be replaced by the downloaded version, so the previous version "
+                   f"is still in use.\n\nFolder: {app_dir}\nReason: ")
+    failed_tail = (f"\n\nThe new version is kept in {new_dir}. Close {APP_NAME} and replace the folder "
+                   f"{app_dir} with it by hand, or try Help > Check for Updates again.")
     script = os.path.join(stage, "swap.ps1")
     with open(script, "w", encoding="utf-8-sig") as f:
         f.write(f"""# Written by {APP_NAME} {APP_VERSION}: puts the new version in place after the program has exited
@@ -4006,21 +4012,30 @@ $app = {ps(app_dir)}
 $new = {ps(new_dir)}
 $stage = {ps(stage)}
 $old = $app + '.old'
+$failed = {ps(os.path.expanduser(UPDATE_FAILED_FILE))}
 $env:PYINSTALLER_RESET_ENVIRONMENT = '1'
+# Windows cannot rename a folder that is the current folder of a process: never stand in it
+Set-Location -LiteralPath (Split-Path $app -Parent)
 try {{ Wait-Process -Id {pid or os.getpid()} }} catch {{ }}  # also when the program is closed hours later
 if (Test-Path -LiteralPath $old) {{ Remove-Item -LiteralPath $old -Recurse -Force -ErrorAction SilentlyContinue }}
 $moved = $false
+$problem = 'unknown'
 for ($i = 0; $i -lt 60 -and -not $moved; $i++) {{
     try {{ Rename-Item -LiteralPath $app -NewName (Split-Path $old -Leaf); $moved = $true }}
-    catch {{ Start-Sleep -Milliseconds 500 }}
+    catch {{ $problem = $_.Exception.Message; Start-Sleep -Milliseconds 500 }}
 }}
 if ($moved) {{
     try {{ Move-Item -LiteralPath $new -Destination $app }}
-    catch {{ Rename-Item -LiteralPath $old -NewName (Split-Path $app -Leaf); $moved = $false }}
+    catch {{ $problem = $_.Exception.Message; Rename-Item -LiteralPath $old -NewName (Split-Path $app -Leaf); $moved = $false }}
+}}
+if (-not $moved) {{  # reported by the program at its next start; the new version is kept in $stage
+    try {{ Set-Content -LiteralPath $failed -Encoding UTF8 -Value ({ps(failed_head)} + $problem + {ps(failed_tail)}) }} catch {{ }}
 }}
 {start if relaunch else "# not restarted: the new version runs at the next start"}
-if ($moved) {{ Remove-Item -LiteralPath $old -Recurse -Force -ErrorAction SilentlyContinue }}
-Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+if ($moved) {{
+    Remove-Item -LiteralPath $old -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+}}
 """)
     return ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", script]
 
@@ -4065,18 +4080,25 @@ def prepare_mac_swap(dmg_path, files=(), relaunch=True, app=None, pid=None):
             pass
     q = shlex.quote
     open_cmd = "open " + q(app) + (" --args " + " ".join(q(f) for f in files if f) if any(files) else "")
+    failed = (f"{APP_NAME} could not be replaced by the downloaded version, so the previous version is "
+              f"still in use.\n\nApplication: {app}\n\nTry Help > Check for Updates again, or install it "
+              f"from {RELEASES_PAGE} by hand.")
     script = os.path.join(stage, "swap.sh")
     with open(script, "w", encoding="utf-8") as f:
         f.write(f"""#!/bin/sh
 # Written by {APP_NAME} {APP_VERSION}: puts the new version in place after the program has exited
+cd {q(parent)} || cd /
 while kill -0 {pid or os.getpid()} 2>/dev/null; do sleep 0.3; done
+moved=0
 if mv {q(app)} {q(os.path.join(stage, "old.app"))}; then
     if mv {q(os.path.join(stage, APP_NAME + ".app"))} {q(app)}; then
+        moved=1
         /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f {q(app)} >/dev/null 2>&1
     else
         mv {q(os.path.join(stage, "old.app"))} {q(app)}
     fi
 fi
+[ "$moved" = 1 ] || printf '%s\n' {q(failed)} > {q(os.path.expanduser(UPDATE_FAILED_FILE))}
 {open_cmd if relaunch else ": the new version runs at the next start"}
 rm -rf {q(stage)}
 """)
@@ -4126,14 +4148,20 @@ def install_linux_package(kind, path):
 
 
 def start_detached(cmd):
-    """Run cmd in the background so that it outlives this program."""
+    """Run cmd in the background so that it outlives this program.
+
+    It runs in the home folder, not in the current folder: started from Explorer, a Windows
+    program runs in its own folder, and Windows cannot rename a folder that is the current
+    folder of a process, so an inherited one would block the update swap."""
     env = dict(os.environ, **RELAUNCH_ENV)
+    home = os.path.expanduser("~")
+    cwd = home if os.path.isdir(home) else tempfile.gettempdir()
     if sys.platform.startswith("win"):
         flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        subprocess.Popen(cmd, creationflags=flags, env=env, stdin=subprocess.DEVNULL,
+        subprocess.Popen(cmd, creationflags=flags, env=env, cwd=cwd, stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
     else:
-        subprocess.Popen(cmd, start_new_session=True, env=env, stdin=subprocess.DEVNULL,
+        subprocess.Popen(cmd, start_new_session=True, env=env, cwd=cwd, stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
 
 
@@ -6150,6 +6178,7 @@ class FSPGuiApp:
         """At the first start ask whether to install the program; later offer to update the
         installed copy, from this copy if it is newer, or else once a week from GitHub."""
         platform = platform or sys.platform
+        self.report_failed_update()
         config = load_config()
         question = startup_question(config, platform)
         if question is None:
@@ -6177,6 +6206,19 @@ class FSPGuiApp:
             config = load_config()
             config["update_declined"] = APP_VERSION
             save_config(config)
+
+    def report_failed_update(self):
+        """Tell what the swap script wrote if it could not put a downloaded version in place."""
+        path = os.path.expanduser(UPDATE_FAILED_FILE)
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                text = f.read().strip()
+            os.remove(path)
+        except OSError:
+            return
+        if text:
+            self.set_status("\u2717 The update was not put in place", "error")
+            self.message(f"Update {APP_NAME}", text)
 
     def ask_install(self, platform=None, first_start=False):
         """Ask where to install the program (Help > Install, and the question at the first start)."""
