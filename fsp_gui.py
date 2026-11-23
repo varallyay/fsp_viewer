@@ -4836,7 +4836,7 @@ class FSPGuiApp:
 
         FlatButton(
             plot_header,
-            "🖼 Copy Picture",
+            "Copy Picture",
             lambda: self.copy_picture_to_clipboard(self.fig),
             variant="ghost",
             size=9,
@@ -5439,7 +5439,7 @@ class FSPGuiApp:
         ).pack(side=tk.RIGHT, padx=6)
         FlatButton(
             top,
-            "🖼 Copy Picture",
+            "Copy Picture",
             lambda: self.copy_picture_to_clipboard(self.popout_fig),
             variant="secondary",
             size=10,
