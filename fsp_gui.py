@@ -87,7 +87,7 @@ os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 # Application parameters - edit these to customise the app
 # ======================================================================
 APP_NAME = "FSP Viewer"         # Window title, name of the installed application and (macOS) menu-bar name
-APP_VERSION = "0.2.8"           # See the version history in README.md
+APP_VERSION = "0.2.9"           # See the version history in README.md
 APP_DESCRIPTION = "Lumerical FSP 3D Viewer & Results Analyzer"
 APP_SLUG = "fsp_viewer"         # Folder and file names of the installation
 APP_CLASS = "Fsp_viewer"        # Window class (Linux: connects the windows to the menu entry)
@@ -135,8 +135,8 @@ else:
 # so a new font or font size (File > Settings) changes the text in the open windows at once.
 FONT_SIZE_DEFAULT = 10      # size of the normal text (pt); the settings can change it, all text follows
 UI_SCALE_CHOICES = (100, 125, 150, 175, 200)   # interface scales (%) offered besides "Automatic"
-LAYOUT_DEFAULTS = {"split_plot": 0.53,     # width of the views (and the parameters) : the whole width
-                   "split_editor": 0.64}   # height of the four views : the left side
+LAYOUT_DEFAULTS = {"split_plot": 0.55,     # width of the views (and the parameters) : the whole width
+                   "split_editor": 0.75}   # height of the four views : the left side
 ALL_OBJECTS = "All objects"  # the choice of the Object selector for the analyses of the whole model
 UI_SCALE = 1.0              # set by init_ui_scale() when the main window opens
 UI = {"font": FONT_UI, "mono": FONT_MONO, "size": FONT_SIZE_DEFAULT}
@@ -4165,6 +4165,108 @@ def start_detached(cmd):
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
 
 
+# ======================================================================
+# Pictures to the Clipboard (Tk itself copies only text)
+# ======================================================================
+PICTURE_DPI = 200   # resolution of a copied plot (dots per inch of the figure)
+
+
+def figure_png(fig, dpi=PICTURE_DPI):
+    """The figure as PNG bytes, on its own background colour."""
+    import io
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi, facecolor=fig.get_facecolor())
+    return buf.getvalue()
+
+
+def copy_png_to_clipboard(png):
+    """Put a PNG picture on the system clipboard; raises RuntimeError with the reason if it cannot.
+    macOS: through osascript; Windows: as a bitmap (CF_DIB) and as PNG, for programs that take
+    either; Linux: through wl-copy (Wayland) or xclip (X11), one of which must be installed."""
+    if sys.platform.startswith("win"):
+        _copy_png_windows(png)
+        return
+    fd, path = tempfile.mkstemp(suffix=".png", prefix="fsp_viewer_")
+    with os.fdopen(fd, "wb") as f:
+        f.write(png)
+    try:
+        if sys.platform == "darwin":
+            cmd = ["osascript", "-e", f'set the clipboard to (read (POSIX file "{path}") as «class PNGf»)']
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+            if result.returncode:
+                raise RuntimeError(result.stderr.strip() or "osascript failed")
+            return
+        tools = []
+        if os.environ.get("WAYLAND_DISPLAY") and shutil.which("wl-copy"):
+            tools.append(["wl-copy", "--type", "image/png"])
+        if shutil.which("xclip"):
+            tools.append(["xclip", "-selection", "clipboard", "-t", "image/png", "-i"])
+        if not tools:
+            raise RuntimeError("copying a picture needs xclip (X11) or wl-clipboard (Wayland); "
+                               "install one, e.g. sudo apt install xclip")
+        with open(path, "rb") as f:  # both keep running in the background to hand the picture over
+            result = subprocess.run(tools[0], stdin=f, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                    timeout=20)
+        if result.returncode:
+            raise RuntimeError(result.stderr.decode(errors="replace").strip() or f"{tools[0][0]} failed")
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _copy_png_windows(png):
+    import ctypes
+    from ctypes import wintypes
+    import matplotlib.image as mpimg
+    import io
+    rgba = mpimg.imread(io.BytesIO(png), format="png")  # (h, w, 3 or 4), floats 0..1
+    if rgba.dtype != np.uint8:
+        rgba = (np.clip(rgba, 0, 1) * 255 + 0.5).astype(np.uint8)
+    if rgba.shape[2] == 3:
+        rgba = np.concatenate([rgba, np.full(rgba.shape[:2] + (1,), 255, np.uint8)], axis=2)
+    h, w = rgba.shape[:2]
+    pixels = np.ascontiguousarray(rgba[::-1, :, [2, 1, 0, 3]]).tobytes()  # BGRA rows, bottom row first
+    dib = struct.pack("<IiiHHIIiiII", 40, w, h, 1, 32, 0, len(pixels), 7874, 7874, 0, 0) + pixels  # 200 dpi
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    user32.OpenClipboard.argtypes, user32.OpenClipboard.restype = [wintypes.HWND], wintypes.BOOL
+    user32.EmptyClipboard.restype = wintypes.BOOL
+    user32.CloseClipboard.restype = wintypes.BOOL
+    user32.SetClipboardData.argtypes, user32.SetClipboardData.restype = [wintypes.UINT, wintypes.HANDLE], wintypes.HANDLE
+    user32.RegisterClipboardFormatW.argtypes, user32.RegisterClipboardFormatW.restype = [wintypes.LPCWSTR], wintypes.UINT
+    kernel32.GlobalAlloc.argtypes, kernel32.GlobalAlloc.restype = [wintypes.UINT, ctypes.c_size_t], wintypes.HGLOBAL
+    kernel32.GlobalLock.argtypes, kernel32.GlobalLock.restype = [wintypes.HGLOBAL], wintypes.LPVOID
+    kernel32.GlobalUnlock.argtypes, kernel32.GlobalUnlock.restype = [wintypes.HGLOBAL], wintypes.BOOL
+    kernel32.GlobalFree.argtypes, kernel32.GlobalFree.restype = [wintypes.HGLOBAL], wintypes.HGLOBAL
+
+    def put(fmt, data):
+        handle = kernel32.GlobalAlloc(0x0002, len(data))  # GMEM_MOVEABLE: the clipboard takes it over
+        if not handle:
+            raise RuntimeError("not enough memory for the picture")
+        ptr = kernel32.GlobalLock(handle)
+        ctypes.memmove(ptr, data, len(data))
+        kernel32.GlobalUnlock(handle)
+        if not user32.SetClipboardData(fmt, handle):
+            kernel32.GlobalFree(handle)
+            raise RuntimeError(f"the clipboard refused the picture (error {ctypes.get_last_error()})")
+
+    for _ in range(10):  # another program may hold the clipboard for a moment
+        if user32.OpenClipboard(None):
+            break
+        time.sleep(0.05)
+    else:
+        raise RuntimeError("the clipboard is in use by another program")
+    try:
+        user32.EmptyClipboard()
+        put(8, dib)  # CF_DIB
+        put(user32.RegisterClipboardFormatW("PNG"), png)
+    finally:
+        user32.CloseClipboard()
+
+
 class AppDialog(tk.Toplevel):
     """Modal question in the colours of the program, with its icon and a row of buttons;
     show() returns the key of the chosen button (None if the window was closed).
@@ -4723,11 +4825,22 @@ class FSPGuiApp:
             tooltip="Copy the currently plotted data table to the clipboard",
         ).pack(side=tk.RIGHT, padx=2, pady=3)
 
+        FlatButton(
+            plot_header,
+            "🖼 Copy Picture",
+            lambda: self.copy_picture_to_clipboard(self.fig),
+            variant="ghost",
+            size=9,
+            padx=8,
+            pady=3,
+            tooltip=f"Copy the plot as a picture ({PICTURE_DPI} dpi) to the clipboard, to paste it into a document",
+        ).pack(side=tk.RIGHT, padx=2, pady=3)
+
         self._build_colormap_controls(plot_header, T["panel_bg"]).pack(side=tk.RIGHT, padx=(4, 8), pady=3)
 
         tk.Label(
             plot_header,
-            text="Results Plot Window (5th Window)",
+            text="Results Plot",
             font=ui_font(11, bold=True),
             bg=T["panel_bg"],
             fg=T["text"],
@@ -5192,10 +5305,13 @@ class FSPGuiApp:
         mon = next((mon for mon in m.other_monitors() if mon["name"] == obj), None)
         if mon is not None:
             g = m.h5[mon["group"]]
+            f_mon = m.object_freqs(mon["obj"])
+            # a monitor set to record one frequency (e.g. to keep a long x-y plane small) has only that
+            at = f"at {C0 / f_mon[0] * 1e9:.1f} nm only" if f_mon is not None and f_mon.size == 1 else "at λ"
             if any(c in g for c in ("Ex", "Ey", "Ez")):
-                out.append(("E — |E|² in the plane [h5]", lambda fig, k: self._plot_monitor_2d(fig, mon, "E", k)))
+                out.append((f"E — |E|² in the plane {at} [h5]", lambda fig, k: self._plot_monitor_2d(fig, mon, "E", k)))
             if any(c in g for c in ("Hx", "Hy", "Hz")):
-                out.append(("H — |H|² in the plane [h5]", lambda fig, k: self._plot_monitor_2d(fig, mon, "H", k)))
+                out.append((f"H — |H|² in the plane {at} [h5]", lambda fig, k: self._plot_monitor_2d(fig, mon, "H", k)))
         if obj == self.PORTS_OBJECT:
             out.append(("S — |S|² of the port modes [calc]", lambda fig, k: self._plot_port_S(fig, k)))
         return out
@@ -5311,6 +5427,16 @@ class FSPGuiApp:
             bold=True,
             padx=12,
             pady=4,
+        ).pack(side=tk.RIGHT, padx=6)
+        FlatButton(
+            top,
+            "🖼 Copy Picture",
+            lambda: self.copy_picture_to_clipboard(self.popout_fig),
+            variant="secondary",
+            size=10,
+            padx=12,
+            pady=4,
+            tooltip=f"Copy the plot as a picture ({PICTURE_DPI} dpi) to the clipboard",
         ).pack(side=tk.RIGHT, padx=6)
         self._build_colormap_controls(top, THEME["bar_bg"]).pack(side=tk.RIGHT, padx=6)
 
@@ -6073,8 +6199,16 @@ class FSPGuiApp:
         axs[1].set_title(f"|{quantity}|² (linear)", fontsize=9.5)
         at = float(np.ravel(g[mon["normal"]][()])[0])
         at = at * 1e6 if abs(at) < 1e-2 and at else at
-        fig.suptitle(f"{mon['name']} › {quantity}    λ = {lam:.1f} nm, {mon['normal']} = {at:.4g} μm" if lam else
-                     f"{mon['name']} › {quantity}", color=THEME["text"], fontsize=10.5, fontweight="bold")
+        title = f"{mon['name']} › {quantity}    λ = {lam:.1f} nm, {mon['normal']} = {at:.4g} μm" if lam else \
+            f"{mon['name']} › {quantity}"
+        f_mon = m.object_freqs(mon["obj"])
+        lam_sel = m.get_frequencies_and_wavelengths()[1][k]
+        other = lam is not None and abs(lam - lam_sel) > 0.05
+        if other:  # the monitor did not record the chosen wavelength
+            n = 1 if f_mon is None else f_mon.size
+            title += (f"\nrecorded only at {lam:.1f} nm (the monitor has {n} frequency point{'s' if n > 1 else ''};"
+                      f" chosen: {lam_sel:.1f} nm)")
+        fig.suptitle(title, color=THEME["warning"] if other else THEME["text"], fontsize=10.5, fontweight="bold")
         fig.set_layout_engine("constrained")
         es = max(1, len(u) // 400)
         self._store_grid_export(f"{mon['name']} |{quantity}|^2 (dB)", u[::es], v,
@@ -6124,7 +6258,8 @@ class FSPGuiApp:
         a1.set_ylabel("|S|²")
         a2.set_ylabel("|S|² (dB)")
         a1.set_title(f"source: {src['name']} (port {j}), mode {m.stored_modes(src['name'])[0][0]}", fontsize=9.5)
-        a2.set_title("in dB" + (f"; below −80 dB, not drawn: {', '.join(silent)}" if silent else ""), fontsize=9)
+        a2.set_title("in dB" + (f"; below −80 dB, not drawn: {', '.join(silent)}" if silent else "")
+                     + "\nS11 is found in the field at the source plane: below about −35 dB only approximate", fontsize=9)
         fig.suptitle(f"{self.PORTS_OBJECT} › S  (|S|² from the expansion of the port fields on the port modes)",
                      color=THEME["text"], fontsize=10.5, fontweight="bold")
         fig.set_layout_engine("constrained")
@@ -6645,6 +6780,21 @@ class FSPGuiApp:
         self.root.update()
         n_lines = len(self.last_exported_tsv.splitlines())
         self.set_status(f"✓ Copied to clipboard: {self.last_exported_desc} ({n_lines} lines)", "ok")
+
+    def copy_picture_to_clipboard(self, fig):
+        """Copy the plot (as shown, at PICTURE_DPI) to the clipboard as a picture."""
+        if self.model is None or fig is None or not fig.axes:
+            messagebox.showinfo("No Plot to Copy", "Please open an .fsp file and plot a result first.")
+            return
+        try:
+            with self.busy("Copying the picture"):
+                png = figure_png(fig)
+                copy_png_to_clipboard(png)
+        except Exception as err:
+            self.set_status(f"\u2717 The picture could not be copied: {err}", "error")
+            return
+        w, h = (int(round(v * PICTURE_DPI)) for v in fig.get_size_inches())
+        self.set_status(f"\u2713 Picture copied to the clipboard ({w} \u00d7 {h} pixels): paste it into a document", "ok")
 
 
 def main(argv=None):

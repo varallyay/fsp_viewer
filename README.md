@@ -2,7 +2,7 @@
 
 <img src="icon.png" width="96" alt="FSP Viewer icon: a black square on a yellow background">
 
-**Version 0.2.7** — see [Version History](#version-history).
+**Version 0.2.9** — see [Version History](#version-history).
 
 View Ansys Lumerical FDTD project files (`.fsp`), plot their results and save their geometry as GDS **without a Lumerical license** — as a ready-to-run application that needs no Python, for Windows, macOS and Linux (see [Download](#download)), or as a Python program on any system.
 
@@ -141,7 +141,7 @@ A read-only inspector with line numbers and syntax colours:
 - **Filter** shows only the lines that contain a text; **Copy Text** copies the page to the clipboard.
 
 ### Result plots
-The plot is drawn in the large panel on the right, with the matplotlib toolbar (zoom, pan, save as image); **↗ Separate Window** opens it in a window of its own. **Colors** chooses the colour map of the colour plots (fields, refractive index, XZ propagation): *Default* keeps each plot's own (viridis for n, inferno for \|E\|², magma for the field components), or plasma, viridis, inferno, magma, cividis, turbo, jet, Spectral, rainbow, hot, coolwarm, RdBu, bone, gray; **Reverse** runs the scale the other way. The plot is recoloured without being computed again, and the choice is remembered.
+The plot is drawn in the large panel on the right, with the matplotlib toolbar (zoom, pan, save as image); **↗ Separate Window** opens it in a window of its own; **🖼 Copy Picture** copies it to the clipboard as a picture (200 dpi; on Linux this needs `xclip` or `wl-clipboard`), and **📋 Export Data** copies its numbers as a table. **Colors** chooses the colour map of the colour plots (fields, refractive index, XZ propagation): *Default* keeps each plot's own (viridis for n, inferno for \|E\|², magma for the field components), or plasma, viridis, inferno, magma, cividis, turbo, jet, Spectral, rainbow, hot, coolwarm, RdBu, bone, gray; **Reverse** runs the scale the other way. The plot is recoloured without being computed again, and the choice is remembered.
 
 The **Result** list is made for the open files: it lists what the selected object has, named as Lumerical names it (`getresult`), and marks where each result comes from — **[fsp]** stored in the `.fsp`, **[h5]** stored in the `.h5` field file, **[calc]** calculated by the viewer from them. Lumerical does not store `P`, `T`, the mode expansions or `S`: it calculates them from the fields when asked, and so does the viewer (a `power` result stored with a monitor is used as it is).
 
@@ -155,7 +155,7 @@ The **Result** list is made for the open files: it lists what the selected objec
 | port, mode expansion monitor | **mode profiles** | The refractive index and \|E\|² of each stored mode, with n_eff; or \|Ex\| … \|Hz\| of each mode |
 | source port | **time_signal, P0** | The stored pulse of the source and its stored power spectrum |
 | `FDTD::ports` | **S** | \|S_i1\|² of every port mode, from the port mode expansions: the power leaving through each port in each mode over the power the source injects (magnitudes; the mode phases are not stored) |
-| other 2D monitors (x-y, x-z planes) | **E**, **H** | \|E\|² (\|H\|²) along the device in dB and linear, with the ports and field monitors marked (the components the monitor recorded) |
+| other 2D monitors (x-y, x-z planes) | **E**, **H** | \|E\|² (\|H\|²) along the device in dB and linear, with the ports and field monitors marked (the components the monitor recorded); at the frequencies the monitor recorded — often only one, then named in the Result list |
 | *whole model* | **All planes — T along x and vs λ** | T through every port and field-monitor plane along the device at λ (open diamonds: the part in mode 1 of the port at that x), and their spectra |
 | | **All planes — E** | \|E\|² in up to eight planes side by side |
 | | **All planes — \|S_i1\|² from their power** | P_i / P_source of every plane in dB, and the part in the stored mode |
@@ -205,7 +205,7 @@ The parameters at the top of `fsp_gui.py`:
 | Parameter | Default | Meaning |
 | :--- | :--- | :--- |
 | `APP_NAME` | `"FSP Viewer"` | Window title and name of the installed application |
-| `APP_VERSION` | `"0.2.7"` | Version number; decides whether a copy on GitHub is newer (for the applications: the version tag of the release) |
+| `APP_VERSION` | `"0.2.9"` | Version number; decides whether a copy on GitHub is newer (for the applications: the version tag of the release) |
 | `APP_ICON_YELLOW`, `APP_ICON_BLACK` | `"#ffd700"`, `"#000000"` | Colours of the icon |
 | `APP_ICON_SQUARE` | `0.5` | Side of the black square, as a fraction of the yellow field |
 | `APP_ICON_MARGIN` | `0.1` | Transparent margin on each side, as a fraction of the icon size |
@@ -240,7 +240,7 @@ The release files of [Download](#download) are FSP Viewer packed with Python and
 
 The **Help > Install / Uninstall** menu items of the Python program are not shown in the applications: they are installed and removed as above.
 
-**How they are built.** The GitHub Actions workflow `.github/workflows/release.yml` runs `build_app.py` on GitHub's Windows, macOS (Apple silicon and Intel) and Linux machines whenever a version tag is pushed (`git tag v0.2.7 && git push origin v0.2.7`; the tag must match `APP_VERSION`). On each, `build_app.py` packs the program with PyInstaller (with icon and version information), starts the packed program in a self-test (every library present, the window opens) and makes the packages; on Windows and macOS it also updates a copy of the program from the new package, the way the program does it. On Linux the workflow installs the `.deb` and starts the installed program, and does the same with the `.rpm` on Fedora. When everything has passed, it makes the release of the tag with the packages and the notes of this version from the [Version History](#version-history). Started by hand (*Actions > Release build > Run workflow*) it only keeps the packages as downloads of the run. To build on your own computer (the packages of that system):
+**How they are built.** The GitHub Actions workflow `.github/workflows/release.yml` runs `build_app.py` on GitHub's Windows, macOS (Apple silicon and Intel) and Linux machines whenever a version tag is pushed (`git tag v0.2.9 && git push origin v0.2.9`; the tag must match `APP_VERSION`). On each, `build_app.py` packs the program with PyInstaller (with icon and version information), starts the packed program in a self-test (every library present, the window opens) and makes the packages; on Windows and macOS it also updates a copy of the program from the new package, the way the program does it. On Linux the workflow installs the `.deb` and starts the installed program, and does the same with the `.rpm` on Fedora. When everything has passed, it makes the release of the tag with the packages and the notes of this version from the [Version History](#version-history). Started by hand (*Actions > Release build > Run workflow*) it only keeps the packages as downloads of the run. To build on your own computer (the packages of that system):
 
 ```bash
 python -m pip install -r requirements-build.txt
@@ -319,6 +319,12 @@ Nodes tagged `1000` (structures and layer-builder internals) start with a partly
 ---
 
 ## Version History
+
+### 0.2.9 — 2026-11-23
+- **Copy Picture**: a button in the plot panel and in the separate plot window copies the plot to the clipboard as a picture (200 dpi), to paste into a document or a slide (macOS, Windows; Linux with xclip or wl-clipboard).
+- The window starts with 55 % of its width for the views and 75 % of the left side's height for them (Settings changes this).
+- A monitor set to record one frequency (e.g. the long `xy`/`xz` planes) says so in the Result list ("at 1310.0 nm only") and in the plot when another wavelength is chosen.
+- The S-parameter plot says that \|S11\|², found in the field at the source plane, is only approximate below about −35 dB.
 
 ### 0.2.8 — 2026-11-23
 - **Fix (Windows): an update could leave the old version in place.** Started from Explorer, the program runs in its own folder, and the helper that swaps in the new version inherited that folder as its current folder; Windows does not rename a folder that a process stands in, so the swap gave up and started the old version again. The helper now runs outside the program folder. Copies of 0.2.7 and older still carry the old helper: replace the folder with the new one from the release `.zip` by hand once (or start the program from a shortcut whose *Start in* is another folder, then update).
