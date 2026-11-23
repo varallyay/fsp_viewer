@@ -3205,6 +3205,15 @@ def self_test(report, fsp=None):
     every result is also plotted. Writes a report; returns 0 if all went well, else 1."""
     lines, failed = [f"{APP_NAME} {APP_VERSION} self-test, Python {sys.version.split()[0]}, "
                      f"{sys.platform}, packaged={FROZEN}"], []
+    try:  # a crash (segmentation fault) prints where it happened
+        import faulthandler
+        faulthandler.enable(all_threads=True)
+    except Exception:
+        pass  # no stderr (a windowed program on Windows, macOS)
+
+    def write_report(last=None):
+        with open(report, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines + ([last] if last else [])) + "\n")
 
     def check(name, fn):
         try:
@@ -3213,6 +3222,7 @@ def self_test(report, fsp=None):
         except Exception as err:
             failed.append(name)
             lines.append(f"FAIL  {name}: {type(err).__name__}: {err}")
+        write_report("(running: a crash after this line ends the report here)")
 
     def need(module, what):
         if module is None:
@@ -3272,8 +3282,7 @@ def self_test(report, fsp=None):
             except tk.TclError:
                 pass
     lines.append("RESULT: " + ("all ok" if not failed else "FAILED: " + ", ".join(failed)))
-    with open(report, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+    write_report()
     return 1 if failed else 0
 
 
